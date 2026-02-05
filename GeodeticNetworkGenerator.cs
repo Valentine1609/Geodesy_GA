@@ -2346,8 +2346,9 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             Debug.LogWarning($"СЕТЬ ИМЕЕТ {zeroCount} НЕОПРЕДЕЛЁННЫХ СТЕПЕНЕЙ СВОБОДЫ!");
 
         // ===== 3. ЧИСЛО ОБУСЛОВЛЕННОСТИ ГЕОМЕТРИИ =====
-        // Пропускаем первые 7 собственных значений (3 сдвига + 3 поворота + 1 масштаб)
-        int startIdx = 7;
+        // Пропускаем первые 6 собственных значений (3 сдвига + 3 поворота)
+        // Масштаб фиксирован измерениями расстояний
+        int startIdx = 6;
         if (eig_raw.Length <= startIdx)
         {
             Debug.LogError("Недостаточно измерений для оценки геометрии сети.");
@@ -2414,11 +2415,9 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         else
             Debug.LogError("Геометрия сети: СЛАБАЯ (риск потери точности)");
 
-        // ===== 6. ОЦЕНКА ТОЧНОСТИ МАРОК =====
-        // Для корректной оценки нужна апостериорная дисперсия
-        double aposteriorVariance = ComputeAposteriorVariance();
-
-        Debug.Log($"\n=== ОЦЕНКА ТОЧНОСТИ (апостериорная дисперсия: {aposteriorVariance:F6}) ===");
+        // ===== 6. ОЦЕНКА ТОЧНОСТИ МАРОК (σ₀ = 1 — относительная оценка) =====
+        Debug.Log("\n=== ОЦЕНКА ОТНОСИТЕЛЬНОЙ ТОЧНОСТИ (σ₀ = 1) ===");
+        Debug.Log("Внимание: для абсолютных ошибок требуется апостериорная дисперсия из невязок!");
 
         double maxSigma = 0, sumSigma = 0;
         int count = 0;
@@ -2429,10 +2428,10 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             int k = offset + i * 3;
             if (k + 2 >= n) continue;
 
-            // Извлечение дисперсий с учётом апостериорной дисперсии
-            double sx = Math.Sqrt(Math.Max(0, invN[k, k] * aposteriorVariance));
-            double sy = Math.Sqrt(Math.Max(0, invN[k + 1, k + 1] * aposteriorVariance));
-            double sz = Math.Sqrt(Math.Max(0, invN[k + 2, k + 2] * aposteriorVariance));
+            // Извлечение дисперсий (диагональные элементы ковариационной матрицы)
+            double sx = Math.Sqrt(Math.Max(0, invN[k, k]));
+            double sy = Math.Sqrt(Math.Max(0, invN[k + 1, k + 1]));
+            double sz = Math.Sqrt(Math.Max(0, invN[k + 2, k + 2]));
 
             // Система координат Unity: X,Z — план, Y — высота
             double sigmaPlan = Math.Sqrt(sx * sx + sz * sz); // план = X + Z
@@ -2470,7 +2469,6 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
         Debug.Log("\n=== ОТЧЁТ ЗАВЕРШЁН ===");
     }
-
 
     // ==========================================================================
     //         NORMAL MATRIX + CONDITION NUMBER + PSEUDOINVERSE (3D, Unity)
@@ -2686,51 +2684,48 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             {
                 double w_scale = 1e12 / dist_sq;
 
-                // Производные по координатам станций 1 и 2
-                int s1_idx = 0, s2_idx = 1;
+                // Станция 1 (индекс 0)
+                N[0, 0] += w_scale * dx * dx;
+                N[0, 1] += w_scale * dx * dy;
+                N[0, 2] += w_scale * dx * dz;
+                N[1, 0] += w_scale * dy * dx;
+                N[1, 1] += w_scale * dy * dy;
+                N[1, 2] += w_scale * dy * dz;
+                N[2, 0] += w_scale * dz * dx;
+                N[2, 1] += w_scale * dz * dy;
+                N[2, 2] += w_scale * dz * dz;
 
-                // Станция 1
-                N[s1_idx * 3 + 0, s1_idx * 3 + 0] += w_scale * dx * dx;
-                N[s1_idx * 3 + 0, s1_idx * 3 + 1] += w_scale * dx * dy;
-                N[s1_idx * 3 + 0, s1_idx * 3 + 2] += w_scale * dx * dz;
-                N[s1_idx * 3 + 1, s1_idx * 3 + 0] += w_scale * dy * dx;
-                N[s1_idx * 3 + 1, s1_idx * 3 + 1] += w_scale * dy * dy;
-                N[s1_idx * 3 + 1, s1_idx * 3 + 2] += w_scale * dy * dz;
-                N[s1_idx * 3 + 2, s1_idx * 3 + 0] += w_scale * dz * dx;
-                N[s1_idx * 3 + 2, s1_idx * 3 + 1] += w_scale * dz * dy;
-                N[s1_idx * 3 + 2, s1_idx * 3 + 2] += w_scale * dz * dz;
+                // Станция 2 (индекс 1)
+                N[3, 3] += w_scale * dx * dx;
+                N[3, 4] += w_scale * dx * dy;
+                N[3, 5] += w_scale * dx * dz;
+                N[4, 3] += w_scale * dy * dx;
+                N[4, 4] += w_scale * dy * dy;
+                N[4, 5] += w_scale * dy * dz;
+                N[5, 3] += w_scale * dz * dx;
+                N[5, 4] += w_scale * dz * dy;
+                N[5, 5] += w_scale * dz * dz;
 
-                // Станция 2  
-                N[s2_idx * 3 + 0, s2_idx * 3 + 0] += w_scale * dx * dx;
-                N[s2_idx * 3 + 0, s2_idx * 3 + 1] += w_scale * dx * dy;
-                N[s2_idx * 3 + 0, s2_idx * 3 + 2] += w_scale * dx * dz;
-                N[s2_idx * 3 + 1, s2_idx * 3 + 0] += w_scale * dy * dx;
-                N[s2_idx * 3 + 1, s2_idx * 3 + 1] += w_scale * dy * dy;
-                N[s2_idx * 3 + 1, s2_idx * 3 + 2] += w_scale * dy * dz;
-                N[s2_idx * 3 + 2, s2_idx * 3 + 0] += w_scale * dz * dx;
-                N[s2_idx * 3 + 2, s2_idx * 3 + 1] += w_scale * dz * dy;
-                N[s2_idx * 3 + 2, s2_idx * 3 + 2] += w_scale * dz * dz;
+                // Смешанные производные (станция 1 ↔ станция 2)
+                N[0, 3] -= w_scale * dx * dx;
+                N[0, 4] -= w_scale * dx * dy;
+                N[0, 5] -= w_scale * dx * dz;
+                N[1, 3] -= w_scale * dy * dx;
+                N[1, 4] -= w_scale * dy * dy;
+                N[1, 5] -= w_scale * dy * dz;
+                N[2, 3] -= w_scale * dz * dx;
+                N[2, 4] -= w_scale * dz * dy;
+                N[2, 5] -= w_scale * dz * dz;
 
-                // Смешанные производные
-                N[s1_idx * 3 + 0, s2_idx * 3 + 0] -= w_scale * dx * dx;
-                N[s1_idx * 3 + 0, s2_idx * 3 + 1] -= w_scale * dx * dy;
-                N[s1_idx * 3 + 0, s2_idx * 3 + 2] -= w_scale * dx * dz;
-                N[s1_idx * 3 + 1, s2_idx * 3 + 0] -= w_scale * dy * dx;
-                N[s1_idx * 3 + 1, s2_idx * 3 + 1] -= w_scale * dy * dy;
-                N[s1_idx * 3 + 1, s2_idx * 3 + 2] -= w_scale * dy * dz;
-                N[s1_idx * 3 + 2, s2_idx * 3 + 0] -= w_scale * dz * dx;
-                N[s1_idx * 3 + 2, s2_idx * 3 + 1] -= w_scale * dz * dy;
-                N[s1_idx * 3 + 2, s2_idx * 3 + 2] -= w_scale * dz * dz;
-
-                N[s2_idx * 3 + 0, s1_idx * 3 + 0] -= w_scale * dx * dx;
-                N[s2_idx * 3 + 0, s1_idx * 3 + 1] -= w_scale * dx * dy;
-                N[s2_idx * 3 + 0, s1_idx * 3 + 2] -= w_scale * dx * dz;
-                N[s2_idx * 3 + 1, s1_idx * 3 + 0] -= w_scale * dy * dx;
-                N[s2_idx * 3 + 1, s1_idx * 3 + 1] -= w_scale * dy * dy;
-                N[s2_idx * 3 + 1, s1_idx * 3 + 2] -= w_scale * dy * dz;
-                N[s2_idx * 3 + 2, s1_idx * 3 + 0] -= w_scale * dz * dx;
-                N[s2_idx * 3 + 2, s1_idx * 3 + 1] -= w_scale * dz * dy;
-                N[s2_idx * 3 + 2, s1_idx * 3 + 2] -= w_scale * dz * dz;
+                N[3, 0] -= w_scale * dx * dx;
+                N[3, 1] -= w_scale * dx * dy;
+                N[3, 2] -= w_scale * dx * dz;
+                N[4, 0] -= w_scale * dy * dx;
+                N[4, 1] -= w_scale * dy * dy;
+                N[4, 2] -= w_scale * dy * dz;
+                N[5, 0] -= w_scale * dz * dx;
+                N[5, 1] -= w_scale * dz * dy;
+                N[5, 2] -= w_scale * dz * dz;
             }
         }
 
@@ -2758,21 +2753,6 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         isDegenerate = (minEig < regularization * 0.1);
 
         return N;
-    }
-
-    // ==========================================================================
-    //                 ВСПОМОГАТЕЛЬНЫЙ МЕТОД ДЛЯ АПОСТЕРИОРНОЙ ДИСПЕРСИИ
-    // ==========================================================================
-
-    private double ComputeAposteriorVariance()
-    {
-        // В реальной реализации здесь должен быть расчёт на основе невязок
-        // σ₀² = Σ(v²w) / (n - u)
-        // где n - число измерений, u - число неизвестных
-
-        // Для демонстрационных целей возвращаем 1.0
-        // В реальном приложении нужно реализовать расчёт невязок
-        return 1.0;
     }
     private double[,] BuildRawNormalMatrix()
     {
