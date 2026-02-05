@@ -1814,9 +1814,9 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     // Проверка прямой видимости между точками
     private bool HasLineOfSight(Vector3 fromPos, Vector3 toPos)
     {
-        // Параметры
         float maxDistance = 100f;
-        float rayRadius = 0.05f; // 5 см — реалистичный радиус лазерного луча
+        float startTolerance = 0.2f;
+        float endTolerance = 0.35f;
 
         Vector3 dir = toPos - fromPos;
         float dist = dir.magnitude;
@@ -1830,19 +1830,29 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         dir = toAdjusted - fromAdjusted;
         dist = dir.magnitude;
 
-        // Используем SphereCast вместо Raycast — учитывает толщину луча
-        if (Physics.SphereCast(
+        // Важный нюанс: SphereCast может ложноположительно цеплять фасад рядом с маркой,
+        // поэтому используем обычный RaycastAll и вручную фильтруем попадания у старта/финиша.
+        RaycastHit[] hits = Physics.RaycastAll(
             fromAdjusted,
-            rayRadius,
             dir.normalized,
-            out RaycastHit hit,
             dist,
             obstacleLayer,
-            QueryTriggerInteraction.Collide))
+            QueryTriggerInteraction.Ignore);
+
+        foreach (RaycastHit hit in hits)
         {
-            // Если попали не в конечную точку — есть препятствие
-            if (Vector3.Distance(hit.point, toAdjusted) > 0.1f)
-                return false;
+            if (hit.collider == null)
+                continue;
+
+            // Игнорируем попадания слишком близко к станции или к самой цели.
+            // Это устраняет случай, когда луч касается геометрии марки/фасада у конца.
+            if (hit.distance <= startTolerance)
+                continue;
+
+            if (dist - hit.distance <= endTolerance)
+                continue;
+
+            return false;
         }
 
         return true;
