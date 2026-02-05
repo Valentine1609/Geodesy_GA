@@ -174,6 +174,14 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         // Генетический алгоритм для поиска оптимальной конфигурации станций
         List<Station> bestSolution = RunGeneticAlgorithm();
 
+        // Гарантируем строгую геодезическую валидность перед размещением
+        bestSolution = RepairAndTrimSolution(bestSolution, GetObjectBounds(targetBuilding), targetBuilding.GetComponent<Collider>(), CalculateOptimalDistance(GetObjectBounds(targetBuilding)), 10);
+        if (!IsStrictlyValidSolution(bestSolution))
+        {
+            Debug.LogError("❌ Не удалось построить сеть с 100% покрытием марок и прямой видимостью между всеми станциями.");
+            return;
+        }
+
         // Применяем найденное решение
         foreach (var station in bestSolution)
         {
@@ -198,7 +206,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 return false;
         }
 
-        // 2. Упрощённая проверка покрытия: хотя бы 80% марок должны быть видны
+        // 2. Строгая проверка покрытия: все марки должны быть видны
         var covered = new HashSet<Transform>();
         foreach (var s in solution)
         {
@@ -208,9 +216,23 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             }
         }
 
-        // УСПОКОИЛИ условие: достаточно 80% покрытия
+        // Строгое условие: 100% покрытия
         float coverageRatio = (float)covered.Count / grades.Count;
-        return coverageRatio >= 0.8f; // Было: coverageRatio == 1.0f
+        if (coverageRatio < 1.0f)
+            return false;
+
+        for (int i = 0; i < solution.Count; i++)
+        {
+            for (int j = i + 1; j < solution.Count; j++)
+            {
+                Vector3 fromEye = solution[i].position + Vector3.up * 1.7f;
+                Vector3 toEye = solution[j].position + Vector3.up * 1.7f;
+                if (!HasLineOfSight(fromEye, toEye))
+                    return false;
+            }
+        }
+
+        return true;
     }
     private Dictionary<Vector3Int, HashSet<Transform>> visibilityCache = new Dictionary<Vector3Int, HashSet<Transform>>();
     private void ClearCache()
@@ -655,7 +677,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 return GenerateFallbackSolution(bounds, buildingCollider, baseOffset);
             }
 
-            if (finalCovered.Count == grades.Count)
+            if (finalCovered.Count == grades.Count && HasFullInterStationLineOfSight(bestSolution))
             {
                 Debug.Log($"=== РЕЗУЛЬТАТ ГА ===");
                 Debug.Log($"Лучшее решение: {validStations} станций");
@@ -669,19 +691,9 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             {
                 Debug.LogWarning($"⚠️ Частичный успех: {finalCovered.Count}/{grades.Count} марок, " +
                                $"Станций={validStations}");
-
-                // Если покрытие недостаточное, пробуем улучшить через fallback
-                if (finalCovered.Count < grades.Count * 0.8f) // Меньше 80% покрытия
-                {
-                    Debug.Log("Попытка улучшить через fallback...");
-                    var fallback = GenerateFallbackSolution(bounds, buildingCollider, baseOffset);
-
-                    // Выбираем лучшее решение
-                    float bestFitnessVal = CalculateFitness(bestSolution, bounds, buildingCollider);
-                    float fallbackFitness = CalculateFitness(fallback, bounds, buildingCollider);
-
-                    return fallbackFitness > bestFitnessVal ? fallback : bestSolution;
-                }
+                Debug.Log("Покрытие/связность нестрогие, используем fallback...");
+                var fallback = GenerateFallbackSolution(bounds, buildingCollider, baseOffset);
+                return IsStrictlyValidSolution(fallback) ? fallback : new List<Station>();
             }
 
             return RepairAndTrimSolution(bestSolution.Where(s => s != null).ToList(), bounds, buildingCollider, baseOffset, 10);
@@ -1289,6 +1301,10 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         }
 
         // ================== 5. ГЛАВНЫЙ ФИТНЕС: ПОЛНОЕ ПОКРЫТИЕ + РЕДУНДАНТНОСТЬ ==================
+        // ЖЁСТКОЕ требование: полная взаимная видимость между всеми станциями
+        if (!HasFullInterStationLineOfSight(solution))
+            return DEAD_PENALTY;
+
         float fitness = 100000f;
 
         // ================== 6. МИНИМИЗАЦИЯ КОЛИЧЕСТВА СТАНЦИЙ ==================
@@ -1601,7 +1617,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         {
             int replaceIdx = UnityEngine.Random.Range(Mathf.Max(1, population.Count / 2), population.Count);
             var randomSolution = GenerateRandomSolution(candidatePositions, UnityEngine.Random.Range(0, 100000));
-            if (randomSolution != null && randomSolution.Count >= minStations)
+            if (randomSolution != null && randomSolution.Count >= minStations && HasFullInterStationLineOfSight(randomSolution))
             {
                 population[replaceIdx] = randomSolution;
             }
@@ -1658,6 +1674,9 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 int newCoverage = visible.Count(g => uncovered.Contains(g));
                 if (newCoverage <= 0) continue;
 
+                if (!CanSeeAllStations(pos, repaired))
+                    continue;
+
                 repaired.Add(new Station { position = pos, visibleGrades = visible });
                 foreach (var g in visible) uncovered.Remove(g);
 
@@ -1681,10 +1700,15 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
             var pos = candidates[UnityEngine.Random.Range(0, candidates.Count)];
             var visible = GetVisibleGradesFromPos(pos);
-            if (visible.Count > 0)
+            if (visible.Count > 0 && CanSeeAllStations(pos, repaired))
                 repaired.Add(new Station { position = pos, visibleGrades = visible });
             else
                 break;
+        }
+
+        if (!HasFullInterStationLineOfSight(repaired))
+        {
+            repaired = repaired.Where((s, idx) => CanSeeAllStations(s.position, repaired.Where((_, j) => j != idx).ToList())).ToList();
         }
 
         return repaired;
@@ -1718,7 +1742,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 }
             }
 
-            if (bestCoveredCount > 0)
+            if (bestCoveredCount > 0 && CanSeeAllStations(bestPos, solution))
             {
                 solution.Add(new Station { position = bestPos, visibleGrades = bestCoverage });
                 foreach (var grade in bestCoverage)
@@ -1742,6 +1766,12 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         {
             Debug.LogError($"❌ Fallback не смог покрыть {uncoveredGrades.Count} марок: " +
                           string.Join(", ", uncoveredGrades.Select(g => g.name)));
+        }
+
+        if (!IsStrictlyValidSolution(solution))
+        {
+            Debug.LogError("❌ Fallback не смог обеспечить строгие условия (100% марки + прямая видимость между всеми станциями).");
+            return new List<Station>();
         }
 
         return solution;
@@ -1815,6 +1845,12 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             if (Vector3.Distance(existingStation.position, spawn) < minStationDistance)
             {
                 Debug.LogWarning($"Станция слишком близко к существующей станции!");
+                return false;
+            }
+
+            if (!HasLineOfSight(spawn + Vector3.up * 1.7f, existingStation.position + Vector3.up * 1.7f))
+            {
+                Debug.LogWarning("Станция не имеет прямой видимости с уже размещенной станцией");
                 return false;
             }
         }
@@ -1962,6 +1998,62 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         }
 
         return true;
+    }
+
+    private bool CanSeeAllStations(Vector3 candidatePos, List<Station> existing)
+    {
+        if (existing == null || existing.Count == 0) return true;
+
+        Vector3 fromEye = candidatePos + Vector3.up * 1.7f;
+        foreach (var st in existing)
+        {
+            if (st == null) continue;
+            Vector3 toEye = st.position + Vector3.up * 1.7f;
+            if (!HasLineOfSight(fromEye, toEye))
+                return false;
+        }
+
+        return true;
+    }
+
+    private bool HasFullInterStationLineOfSight(List<Station> solution)
+    {
+        if (solution == null || solution.Count < 2)
+            return solution != null && solution.Count >= minStations;
+
+        for (int i = 0; i < solution.Count; i++)
+        {
+            for (int j = i + 1; j < solution.Count; j++)
+            {
+                Vector3 fromEye = solution[i].position + Vector3.up * 1.7f;
+                Vector3 toEye = solution[j].position + Vector3.up * 1.7f;
+                if (!HasLineOfSight(fromEye, toEye))
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    private bool IsStrictlyValidSolution(List<Station> solution)
+    {
+        if (solution == null || solution.Count < minStations)
+            return false;
+
+        var covered = new HashSet<Transform>();
+        foreach (var station in solution)
+        {
+            if (station == null || IsInsideAnyBuilding(station.position))
+                return false;
+
+            station.visibleGrades = GetVisibleGradesFromPos(station.position);
+            if (station.visibleGrades == null || station.visibleGrades.Count == 0)
+                return false;
+
+            covered.UnionWith(station.visibleGrades);
+        }
+
+        return covered.Count == grades.Count && HasFullInterStationLineOfSight(solution);
     }
 
     // Дополнительные вспомогательные методы для проверки принадлежности к зданию
