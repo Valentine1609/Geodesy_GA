@@ -30,8 +30,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     public LayerMask obstacleLayer;
     [Header("Ограничения количества станций")]
     public int minStations = 4;
-    [Range(0.4f, 1.0f)] public float requiredObservationRedundancy = 0.4f;
-    [Range(2, 4)] public int minStationsPerGrade = 2;
+    [Range(0.4f, 0.8f)] public float requiredObservationRedundancy = 0.4f;
+    [Range(1, 3)] public int minStationsPerGrade = 2;
     [Header("Шаг 2 — закрепление пунктов")]
     public float frostDepthMeters = 1.7f;
     public float minExternalAnchorDepthMeters = 2.5f;
@@ -224,7 +224,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         float coverageRatio = (float)covered.Count / grades.Count;
         int wellObserved = observationCount.Values.Count(v => v >= minStationsPerGrade);
         float wellObservedRatio = (float)wellObserved / grades.Count;
-        return coverageRatio >= 0.95f && wellObservedRatio >= requiredObservationRedundancy;
+        return coverageRatio >= 0.85f && wellObservedRatio >= requiredObservationRedundancy;
     }
     private Dictionary<Vector3Int, HashSet<Transform>> visibilityCache = new Dictionary<Vector3Int, HashSet<Transform>>();
     private void ClearCache()
@@ -1142,6 +1142,11 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                     {
                         candidates.Add(groundPos);
                     }
+                    else if (Vector3.Distance(groundPos, wallPoint) > perimeterClearance * 0.65f)
+                    {
+                        // Допускаем часть ближних точек, чтобы не потерять работоспособность в тесной сцене.
+                        candidates.Add(groundPos);
+                    }
                 }
             }
         }
@@ -1175,7 +1180,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                             if (!IsInsideAnyBuilding(groundPos))
                             {
                                 Vector3 wallPoint = buildingCollider.ClosestPoint(groundPos);
-                                if (Vector3.Distance(groundPos, wallPoint) > GetRestrictedPerimeterDistance(bounds) * 0.8f)
+                                if (Vector3.Distance(groundPos, wallPoint) > GetRestrictedPerimeterDistance(bounds) * 0.6f)
                                 {
                                     candidates.Add(groundPos);
                                 }
@@ -1203,6 +1208,25 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 uniqueCandidates.Add(candidate);
         }
 
+        if (uniqueCandidates.Count == 0)
+        {
+            Debug.LogWarning("После фильтрации не осталось кандидатов — ослабляем ограничения.");
+            int relaxedPoints = 24;
+            for (int i = 0; i < 360; i += 360 / relaxedPoints)
+            {
+                float angle = i * Mathf.Deg2Rad;
+                Vector3 dir = new Vector3(Mathf.Cos(angle), 0, Mathf.Sin(angle));
+                Vector3 point = bounds.center + dir * Mathf.Max(6f, offset * 0.9f);
+                Vector3 rayStart = point + Vector3.up * rayStartOffset;
+                if (Physics.Raycast(rayStart, Vector3.down, out RaycastHit relaxedHit, rayStartOffset + 20f, groundLayer))
+                {
+                    Vector3 gp = relaxedHit.point;
+                    if (!IsInsideAnyBuilding(gp))
+                        uniqueCandidates.Add(gp);
+                }
+            }
+        }
+
         Debug.Log($"Сгенерировано {uniqueCandidates.Count} валидных позиций (оптимизировано)");
         return uniqueCandidates;
     }
@@ -1226,13 +1250,14 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     private float GetRestrictedPerimeterDistance(Bounds bounds)
     {
         float footprint = Mathf.Max(bounds.extents.x, bounds.extents.z);
-        return Mathf.Max(restrictedZoneBuffer, footprint * 0.25f);
+        return Mathf.Clamp(Mathf.Max(restrictedZoneBuffer, footprint * 0.25f), 4f, 12f);
     }
 
     private float CalculateRequiredObservationCount()
     {
         int unknownParameters = Mathf.Max(1, grades.Count * 2);
-        int minObservations = Mathf.CeilToInt(unknownParameters / (1f - requiredObservationRedundancy));
+        float safeRedundancy = Mathf.Clamp(requiredObservationRedundancy, 0.1f, 0.85f);
+        int minObservations = Mathf.CeilToInt(unknownParameters / (1f - safeRedundancy));
         return Mathf.Max(minObservations, grades.Count * minStationsPerGrade);
     }
 
@@ -1250,9 +1275,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             if (IsInsideAnyBuilding(station.position))
                 return DEAD_PENALTY;
 
-            Vector3 wallPoint = buildingCollider.ClosestPoint(station.position);
-            if (Vector3.Distance(station.position, wallPoint) < GetRestrictedPerimeterDistance(bounds) * 0.8f)
-                return DEAD_PENALTY;
+            // Станции допускаются ближе к зданию, но это штрафуется в фитнесе.
         }
 
         // ================== 2. ПРОВЕРКА НА СЛИШКОМ БЛИЗКОЕ РАСПОЛОЖЕНИЕ ==================
@@ -1266,6 +1289,19 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 {
                     return DEAD_PENALTY;
                 }
+            }
+        }
+
+        // Штраф за станции вблизи зоны влияния здания (без полной блокировки решения)
+        float perimeterPenalty = 0f;
+        float restrictedDistance = GetRestrictedPerimeterDistance(bounds);
+        foreach (var station in solution)
+        {
+            Vector3 wallPoint = buildingCollider.ClosestPoint(station.position);
+            float distToWall = Vector3.Distance(station.position, wallPoint);
+            if (distToWall < restrictedDistance)
+            {
+                perimeterPenalty += (restrictedDistance - distToWall) * 1800f;
             }
         }
 
@@ -1320,6 +1356,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         // ================== 5. ГЛАВНЫЙ ФИТНЕС: ПОЛНОЕ ПОКРЫТИЕ + РЕДУНДАНТНОСТЬ ==================
         float fitness = 100000f;
         fitness += achievedObservationRatio * 12000f;
+        fitness -= perimeterPenalty;
 
         // ================== 6. МИНИМИЗАЦИЯ КОЛИЧЕСТВА СТАНЦИЙ ==================
         int optimalCount = Mathf.Max(minStations, Mathf.CeilToInt(grades.Count / 2.2f));
