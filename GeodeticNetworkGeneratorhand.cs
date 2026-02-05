@@ -16,6 +16,7 @@ using UnityEngine;
 using UnityEngine.UI;
 using Debug = UnityEngine.Debug;
 
+
 public class GeodeticNetworkGeneratorhand : MonoBehaviour
 {
     [Header("Настройки")]
@@ -114,7 +115,7 @@ public class GeodeticNetworkGeneratorhand : MonoBehaviour
 
         selectedStations.Clear();
 
-        var reMS60 = new Regex(@"MS60\s*\((\d+)\)");
+        var reMS60 = new Regex(@"(?:MS60|total_station)\s*\((\d+)\)");
         var reGrade = new Regex(@"Grade\s*\((\d+)\)");
 
         // --- Сбор пронумерованных MS60 ---
@@ -197,12 +198,6 @@ public class GeodeticNetworkGeneratorhand : MonoBehaviour
 
         Debug.Log($"GenerateNetwork: построено линий (станция->марка): stations={selectedStations.Count}, grades={grades.Count}");
         PrintNetworkReport();
-        ConditioningResult cond = ComputeConditionNumber();
-
-        Debug.Log(
-            $"Condition number = {cond.conditionNumber:E3} " +
-            $"(λmin={cond.lambdaMin:E3}, λmax={cond.lambdaMax:E3})"
-        );
     }
 
 
@@ -508,175 +503,221 @@ public class GeodeticNetworkGeneratorhand : MonoBehaviour
         public string report;
     }
 
+    // ==========================================================================
+    //                           NETWORK REPORT (3D)
+    // ==========================================================================
+
     public void PrintNetworkReport()
     {
-        // ===== 1. Геометрическая обусловленность (через AᵀPA) =====
-        ConditioningResult res = ComputeConditionNumber();
-
-        if (double.IsInfinity(res.conditionNumber) ||
-            double.IsNaN(res.conditionNumber) ||
-            res.lambdaMin <= 0.0)
+        if (grades == null || grades.Count == 0)
         {
-            Debug.LogWarning("Число обусловленности не определено. Сеть вырождена или недостаточно наблюдений.");
+            Debug.LogWarning("Нет марок — отчёт сети невозможен.");
             return;
         }
 
-        Debug.Log(
-            $"Число обусловленности сети: κ = {res.conditionNumber:F4} " +
-            $"(λmin = {res.lambdaMin:E2}, λmax = {res.lambdaMax:E2})"
-        );
-
-        // ===== 2. Апостериорные СКО (через SVD матрицы N) =====
-        if (!ComputeConditionNumberSVD(out _, out double[,] invN))
+        if (selectedStations.Count < 2)
         {
-            Debug.LogWarning("Не удалось вычислить апостериорные СКО (SVD).");
+            Debug.LogWarning($"Недостаточно станций ({selectedStations.Count}). Минимум: 2");
             return;
         }
 
-        int M = grades.Count;
-        if (M == 0) return;
+        // Вычисляем параметры сети
+        double cond;
+        double[,] covariance;
+        bool ok = ComputeConditionNumberAndInverse(out cond, out covariance);
 
-        for (int gi = 0; gi < M; gi++)
+        Debug.Log("=== ГЕОДЕЗИЧЕСКИЙ ОТЧЁТ СЕТИ ===");
+        Debug.Log($"Количество марок: {grades.Count}");
+        Debug.Log($"Количество станций: {selectedStations.Count}");
+
+        if (ok)
         {
-            int ix = 2 * gi;
-            int iy = ix + 1;
+            Debug.Log($"Число обусловленности сети: {cond:N0}");
 
-            if (ix >= invN.GetLength(0) || iy >= invN.GetLength(1))
-                continue;
+            // Классификация сети по ГОСТ
+            if (cond < 1000)
+                Debug.Log($"Класс сети: ВЫСОКОЙ ТОЧНОСТИ (cond < 1000)");
+            else if (cond < 5000)
+                Debug.Log($"Класс сети: СТАНДАРТНАЯ (cond < 5000)");
+            else if (cond < 20000)
+                Debug.Log($"Класс сети: ТЕХНИЧЕСКАЯ (cond < 20000)");
+            else
+                Debug.Log($"Класс сети: НИЗКОЙ ТОЧНОСТИ (cond > 20000)");
 
-            double varX = Math.Abs(invN[ix, ix]);
-            double varY = Math.Abs(invN[iy, iy]);
+            // Анализ ошибок положения марок
+            Debug.Log("=== ОШИБКИ ПОЛОЖЕНИЯ МАРОК ===");
 
-            double sigmaX = Math.Sqrt(varX);
-            double sigmaY = Math.Sqrt(varY);
-            double sigmaP = Math.Sqrt(sigmaX * sigmaX + sigmaY * sigmaY);
-
-            Debug.Log(
-                $"Марка {grades[gi].name}: σX={sigmaX:F4}, σY={sigmaY:F4}, σp={sigmaP:F4}"
-            );
-        }
-    }
-
-    private double[,] CreateZeroMatrix(int n)
-    {
-        return new double[n, n];
-    }
-
-    private double[,] ComputeNormalMatrix()
-    {
-        if (selectedStations.Count == 0 || grades.Count == 0)
-        {
-            Debug.LogWarning("Нет станций или марок для вычисления матрицы");
-            return null;
-        }
-
-        int M = grades.Count;
-        int n = 2 * M; // Только X, Y для каждой марки (упрощенно)
-        double[,] N = CreateZeroMatrix(n);
-
-        double sigmaDist_m = DistanceStdevMm / 1000.0;
-        double wDist = 1.0 / (sigmaDist_m * sigmaDist_m);
-
-        double sigmaAngleRad = DirectionStdevCc / 3600.0 * Math.PI / 180.0;
-        double wAngle = 1.0 / (sigmaAngleRad * sigmaAngleRad);
-
-        for (int si = 0; si < selectedStations.Count; si++)
-        {
-            var s = selectedStations[si];
-            if (s.ms60 == null) continue;
-            Vector3 sPos = s.ms60.position;
+            double maxError = 0;
+            double avgError = 0;
+            int validPoints = 0;
 
             for (int gi = 0; gi < grades.Count; gi++)
             {
-                Transform g = grades[gi];
-                if (!HasLineOfSight(s.ms60, g)) continue;
+                int idx = gi * 3;
+                if (idx + 2 >= covariance.GetLength(0)) continue;
 
-
-                Vector3 diff = g.position - sPos;
-                double r = Math.Sqrt(diff.x * diff.x + diff.z * diff.z);
-                if (r <= 1e-6) continue;
-
-                double dx = diff.x / r;
-                double dz = diff.z / r;
-
-                int ix = 2 * gi;
-                int iy = ix + 1;
-
-                // Вклад измерений расстояния
-                N[ix, ix] += wDist * dx * dx;
-                N[ix, iy] += wDist * dx * dz;
-                N[iy, ix] += wDist * dz * dx;
-                N[iy, iy] += wDist * dz * dz;
-
-                // Вклад измерений направлений (упрощенно)
-                double denom = dx * dx + dz * dz;
-                if (denom > 1e-12)
+                try
                 {
-                    double dbdx = -dz / denom;
-                    double dbdz = dx / denom;
-                    N[ix, ix] += wAngle * dbdx * dbdx;
-                    N[ix, iy] += wAngle * dbdx * dbdz;
-                    N[iy, ix] += wAngle * dbdz * dbdx;
-                    N[iy, iy] += wAngle * dbdz * dbdz;
+                    double sigmaX = Math.Sqrt(Math.Abs(covariance[idx, idx]));
+                    double sigmaY = Math.Sqrt(Math.Abs(covariance[idx + 1, idx + 1]));
+                    double sigmaZ = Math.Sqrt(Math.Abs(covariance[idx + 2, idx + 2]));
+
+                    double positionError = Math.Sqrt(sigmaX * sigmaX + sigmaY * sigmaY + sigmaZ * sigmaZ);
+                    double horizontalError = Math.Sqrt(sigmaX * sigmaX + sigmaZ * sigmaZ);
+
+                    maxError = Math.Max(maxError, positionError);
+                    avgError += positionError;
+                    validPoints++;
+
+                    Debug.Log($"Марка {grades[gi].name}: " +
+                             $"σX={sigmaX * 1000:F1} мм, " +
+                             $"σY={sigmaY * 1000:F1} мм, " +
+                             $"σZ={sigmaZ * 1000:F1} мм, " +
+                             $"σгор={horizontalError * 1000:F1} мм, " +
+                             $"σпол={positionError * 1000:F1} мм");
                 }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"Ошибка расчета для марки {grades[gi].name}: {ex.Message}");
+                }
+            }
+
+            if (validPoints > 0)
+            {
+                avgError /= validPoints;
+                Debug.Log($"Средняя ошибка положения: {avgError * 1000:F1} мм");
+                Debug.Log($"Максимальная ошибка: {maxError * 1000:F1} мм");
+
+                if (maxError > 0.01)
+                    Debug.LogWarning("ВНИМАНИЕ: Максимальная ошибка превышает 10 мм!");
+                else if (maxError > 0.005)
+                    Debug.Log("Сеть соответствует требованиям средней точности");
+                else if (maxError > 0.002)
+                    Debug.Log("Сеть соответствует требованиям высокой точности");
+                else
+                    Debug.Log("Сеть соответствует требованиям прецизионных измерений");
+            }
+        }
+        else
+        {
+            Debug.LogError("Не удалось вычислить параметры сети. Возможно сеть вырождена.");
+        }
+
+        // Анализ геометрии сети
+        Debug.Log("=== АНАЛИЗ ГЕОМЕТРИИ СЕТИ ===");
+
+        var coveredGrades = new HashSet<Transform>();
+        foreach (var station in selectedStations)
+        {
+            if (station.visibleGrades != null)
+                coveredGrades.UnionWith(station.visibleGrades);
+        }
+
+        Debug.Log($"Покрыто марок: {coveredGrades.Count}/{grades.Count} ({coveredGrades.Count / (float)grades.Count * 100:F1}%)");
+
+        var uncoveredGrades = grades.Where(g => !coveredGrades.Contains(g)).ToList();
+        if (uncoveredGrades.Count > 0)
+        {
+            Debug.LogWarning($"Непокрытые марки ({uncoveredGrades.Count}): {string.Join(", ", uncoveredGrades.Select(g => g.name))}");
+        }
+
+        int goodAngles = 0;
+        int badAngles = 0;
+
+        foreach (var grade in grades)
+        {
+            var observingStations = selectedStations
+                .Where(s => s.visibleGrades != null && s.visibleGrades.Contains(grade))
+                .ToList();
+
+            if (observingStations.Count >= 2)
+            {
+                bool hasGoodAngle = false;
+                for (int i = 0; i < observingStations.Count - 1; i++)
+                {
+                    for (int j = i + 1; j < observingStations.Count; j++)
+                    {
+                        Vector3 dir1 = observingStations[i].position - grade.position;
+                        Vector3 dir2 = observingStations[j].position - grade.position;
+                        float angle = Vector3.Angle(dir1, dir2);
+
+                        if (angle >= 30f && angle <= 150f)
+                            hasGoodAngle = true;
+                    }
+                }
+
+                if (hasGoodAngle)
+                    goodAngles++;
+                else
+                    badAngles++;
             }
         }
 
-        // Регуляризация для устойчивости
-        double epsilon = 1e-6;
-        for (int i = 0; i < n; i++) N[i, i] += epsilon;
+        Debug.Log($"Марок с хорошей геометрией: {goodAngles}");
+        Debug.Log($"Марок с плохой геометрией: {badAngles}");
 
-        return N;
+        if (badAngles > grades.Count * 0.2f)
+            Debug.LogWarning("Более 20% марок имеют неудовлетворительную геометрию засечки!");
+
+        Debug.Log("=== ОТЧЁТ ЗАВЕРШЁН ===");
     }
 
-    private bool InvertMatrix(double[,] A, out double[,] Ainv)
-    {
-        int n = A.GetLength(0);
-        Ainv = CreateZeroMatrix(n);
-        double[,] m = CreateZeroMatrix(n);
+    // ==========================================================================
+    //         NORMAL MATRIX + CONDITION NUMBER + PSEUDOINVERSE (3D)
+    // ==========================================================================
 
-        for (int i = 0; i < n; i++)
+    private bool ComputeConditionNumberAndInverse(out double condValue, out double[,] invN)
+    {
+        condValue = double.PositiveInfinity;
+        invN = null;
+
+        double quality;
+        double[,] N = ComputeNormalMatrix(out quality);
+        if (N == null) return false;
+
+        int n = N.GetLength(0);
+
+        if (!JacobiEigenDecomposition(N, out double[] eig, out double[,] eigVec))
         {
-            for (int j = 0; j < n; j++) m[i, j] = A[i, j];
-            Ainv[i, i] = 1.0;
+            Debug.LogWarning("Eigen decomposition failed.");
+            return false;
         }
 
-        for (int k = 0; k < n; k++)
+        double minEig = double.MaxValue;
+        double maxEig = double.MinValue;
+
+        for (int i = 0; i < eig.Length; i++)
         {
-            int piv = k;
-            double maxv = Math.Abs(m[k, k]);
-            for (int i = k + 1; i < n; i++)
-            {
-                double av = Math.Abs(m[i, k]);
-                if (av > maxv) { maxv = av; piv = i; }
-            }
-            if (maxv < 1e-12) return false;
+            if (eig[i] < minEig) minEig = eig[i];
+            if (eig[i] > maxEig) maxEig = eig[i];
+        }
 
-            if (piv != k)
-            {
-                for (int j = 0; j < n; j++)
-                {
-                    double tmp = m[k, j]; m[k, j] = m[piv, j]; m[piv, j] = tmp;
-                    tmp = Ainv[k, j]; Ainv[k, j] = Ainv[piv, j]; Ainv[piv, j] = tmp;
-                }
-            }
+        if (minEig <= 1e-15)
+        {
+            Debug.LogWarning("Минимальное собственное значение ~ 0 — сеть вырождена.");
+            return false;
+        }
 
-            double diag = m[k, k];
-            for (int j = 0; j < n; j++)
-            {
-                m[k, j] /= diag;
-                Ainv[k, j] /= diag;
-            }
+        condValue = maxEig / minEig;
+
+        // формируем псевдообратную N⁻¹ = V * Λ⁻¹ * Vᵀ
+        invN = new double[n, n];
+
+        for (int k = 0; k < eig.Length; k++)
+        {
+            double λinv = eig[k] > 1e-15 ? 1.0 / eig[k] : 0.0;
 
             for (int i = 0; i < n; i++)
             {
-                if (i == k) continue;
-                double factor = m[i, k];
-                if (Math.Abs(factor) < 1e-15) continue;
+                double vik = eigVec[i, k];
+                if (Math.Abs(vik) < 1e-15) continue;
+
                 for (int j = 0; j < n; j++)
                 {
-                    m[i, j] -= factor * m[k, j];
-                    Ainv[i, j] -= factor * Ainv[k, j];
+                    double vjk = eigVec[j, k];
+                    if (Math.Abs(vjk) < 1e-15) continue;
+
+                    invN[i, j] += vik * λinv * vjk;
                 }
             }
         }
@@ -684,176 +725,337 @@ public class GeodeticNetworkGeneratorhand : MonoBehaviour
         return true;
     }
 
-    private double MatrixInfinityNorm(double[,] A)
+    // ==========================================================================
+    //                 NORMAL MATRIX BUILDER (3D OBSERVATIONS)
+    // ==========================================================================
+
+    private double[,] ComputeNormalMatrix(out double quality)
     {
-        int n = A.GetLength(0);
-        double maxRow = 0.0;
-        for (int i = 0; i < n; i++)
+        quality = double.PositiveInfinity;
+
+        int M = grades.Count;
+        if (M == 0) return null;
+
+        int n = M * 3;
+        double[,] N = new double[n, n];
+
+        // параметры весов наблюдений
+        double sigmaDist = Math.Max(1e-6, DistanceStdevMm / 1000.0);
+        double wDist = 1.0 / (sigmaDist * sigmaDist);
+
+        double sigmaAng = (DirectionStdevCc / 3600.0) * Math.PI / 180.0; // ИСПРАВЛЕНО: 3600 сек/градус
+        double wAng = 1.0 / (sigmaAng * sigmaAng);
+
+        // --- наполняем N ---
+        for (int si = 0; si < selectedStations.Count; si++)
         {
-            double sum = 0.0;
-            for (int j = 0; j < n; j++) sum += Math.Abs(A[i, j]);
-            if (sum > maxRow) maxRow = sum;
-        }
-        return maxRow;
-    }
+            var st = selectedStations[si];
+            if (st == null || st.ms60 == null) continue;
 
-    private ConditioningResult ComputeConditionNumber()
-    {
-        // 1. Формируем список неизвестных (только марки!)
-        int unknownCount = grades.Count * 2; // X,Y для каждой марки
-        if (unknownCount == 0)
-            return new ConditioningResult { conditionNumber = double.PositiveInfinity };
+            Vector3 S = st.ms60.position;
 
-        // 2. Считаем количество наблюдений
-        int obsCount = 0;
-        foreach (var s in selectedStations)
-            obsCount += s.visibleGrades.Count * 2; // направление + расстояние
+            // находим видимые марки
+            var visible = new List<(int idx, Transform g)>();
 
-        if (obsCount < unknownCount)
-            return new ConditioningResult { conditionNumber = double.PositiveInfinity };
-
-        // 3. Матрица A
-        double[,] A = new double[obsCount, unknownCount];
-        double[,] P = new double[obsCount, obsCount];
-
-        int row = 0;
-
-        for (int s = 0; s < selectedStations.Count; s++)
-        {
-            Vector3 stPos = selectedStations[s].ms60.position;
-
-            foreach (Transform g in selectedStations[s].visibleGrades)
+            for (int gi = 0; gi < M; gi++)
             {
-                int gIndex = grades.IndexOf(g);
-                if (gIndex < 0) continue;
+                var g = grades[gi];
+                if (g == null) continue;
 
-                Vector3 grPos = g.position;
+                if (HasLineOfSight(st.ms60, g))
+                    visible.Add((gi, g));
+            }
 
-                double dx = grPos.x - stPos.x;
-                double dy = grPos.z - stPos.z;
-                double dist = Math.Sqrt(dx * dx + dy * dy);
-                if (dist < 1e-6) continue;
+            if (visible.Count == 0) continue;
 
-                int ix = gIndex * 2;
-                int iy = ix + 1;
+            // расстояния + вертикальные углы
+            foreach (var item in visible)
+            {
+                int gi = item.idx;
+                Transform g = item.g;
 
-                // ---- направление ----
-                A[row, ix] = -dy / (dist * dist);
-                A[row, iy] = dx / (dist * dist);
-                P[row, row] = 1.0 / (DirectionStdevCc * DirectionStdevCc);
-                row++;
+                Vector3 P = g.position;
+                Vector3 d = P - S;
 
-                // ---- расстояние ----
-                A[row, ix] = dx / dist;
-                A[row, iy] = dy / dist;
-                P[row, row] = 1.0 / (DistanceStdevMm * DistanceStdevMm);
-                row++;
+                double dx = d.x;
+                double dy = d.y;
+                double dz = d.z;
+
+                double r = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+                if (r < 1e-9) continue;
+
+                int bi = gi * 3;
+
+                // ------------ расстояние ------------
+                {
+                    double[] row = new double[n];
+                    row[bi + 0] = dx / r;
+                    row[bi + 1] = dy / r;
+                    row[bi + 2] = dz / r;
+                    AccumulateRowToN(N, row, wDist);
+                }
+
+                // ------------ вертикальный угол ------------
+                double h = Math.Sqrt(dx * dx + dz * dz);
+                if (h > 0.2)
+                {
+                    double denom = h * (h * h + dy * dy);
+                    if (Math.Abs(denom) > 1e-15)
+                    {
+                        double dvdx = (-dy * dx) / denom;
+                        double dvdz = (-dy * dz) / denom;
+                        double dvdy = h / (h * h + dy * dy);
+
+                        double[] rowV = new double[n];
+                        rowV[bi + 0] = dvdx;
+                        rowV[bi + 1] = dvdy;
+                        rowV[bi + 2] = dvdz;
+                        AccumulateRowToN(N, rowV, wAng);
+                    }
+                }
+            }
+
+            // горизонтальные углы — пары марок
+            if (visible.Count >= 2)
+            {
+                for (int a = 0; a < visible.Count - 1; a++)
+                {
+                    for (int b = a + 1; b < visible.Count; b++)
+                    {
+                        int i1 = visible[a].idx;
+                        int i2 = visible[b].idx;
+
+                        Vector3 p1 = visible[a].g.position - S;
+                        Vector3 p2 = visible[b].g.position - S;
+
+                        double dx1 = p1.x;
+                        double dz1 = p1.z;
+                        double dx2 = p2.x;
+                        double dz2 = p2.z;
+
+                        double d1 = dx1 * dx1 + dz1 * dz1;
+                        double d2 = dx2 * dx2 + dz2 * dz2;
+                        if (d1 < 1e-12 || d2 < 1e-12) continue;
+
+                        double dth_dx1 = dz1 / d1;
+                        double dth_dz1 = -dx1 / d1;
+                        double dth_dx2 = -dz2 / d2;
+                        double dth_dz2 = dx2 / d2;
+
+                        double[] rowH = new double[n];
+
+                        int bi1 = i1 * 3;
+                        int bi2 = i2 * 3;
+
+                        rowH[bi1 + 0] = dth_dx1;
+                        rowH[bi1 + 2] = dth_dz1;
+
+                        rowH[bi2 + 0] = dth_dx2;
+                        rowH[bi2 + 2] = dth_dz2;
+
+                        AccumulateRowToN(N, rowH, wAng);
+                    }
+                }
             }
         }
 
-        // 4. N = Aᵀ P A
-        double[,] N = MultiplyTranspose(A, P);
-
-        // 5. Собственные значения
-        double[] eigen = ComputeEigenvalues(N);
-
-        double lambdaMin = eigen.Where(v => v > 1e-12).Min();
-        double lambdaMax = eigen.Max();
-
-        return new ConditioningResult
+        // === ФИКСАЦИЯ БАЗИСА СЕТИ (ОБЯЗАТЕЛЬНО) ===
+        // Марка 0 — фиксируем X, Y, Z
+        if (M > 0)
         {
-            lambdaMin = lambdaMin,
-            lambdaMax = lambdaMax,
-            conditionNumber = lambdaMax / lambdaMin
-        };
-    }
-    private double[,] MultiplyTranspose(double[,] A, double[,] P)
-    {
-        int m = A.GetLength(0);
-        int n = A.GetLength(1);
+            int b0 = 0 * 3;
+            N[b0 + 0, b0 + 0] += 1e6;
+            N[b0 + 1, b0 + 1] += 1e6;
+            N[b0 + 2, b0 + 2] += 1e6;
+        }
 
-        double[,] N = new double[n, n];
+        // Марка 1 — фиксируем X и Z (убираем поворот и масштаб)
+        if (M > 1)
+        {
+            int b1 = 1 * 3;
+            N[b1 + 0, b1 + 0] += 1e6;
+            N[b1 + 2, b1 + 2] += 1e6;
+        }
 
+        // общая регуляризация
         for (int i = 0; i < n; i++)
-            for (int j = 0; j < n; j++)
-                for (int k = 0; k < m; k++)
-                    N[i, j] += A[k, i] * P[k, k] * A[k, j];
+            N[i, i] += 1e-9;
+
+        // оцениваем качество как cond
+        if (!JacobiEigenDecomposition(N, out double[] ev, out _))
+        {
+            quality = double.PositiveInfinity;
+            return N;
+        }
+
+        double minE = ev.Min();
+        double maxE = ev.Max();
+
+        quality = (minE <= 1e-15) ? double.PositiveInfinity : maxE / minE;
 
         return N;
     }
-    private double[] ComputeEigenvalues(double[,] M)
+
+    // ==========================================================================
+    //                JACOBI EIGEN DECOMPOSITION (3D, SYMMETRIC)
+    // ==========================================================================
+
+    private bool JacobiEigenDecomposition(double[,] A, out double[] eval, out double[,] evec, int maxIter = 200)
     {
-        int n = M.GetLength(0);
-        double[] values = new double[n];
-        double[,] B = (double[,])M.Clone();
+        int n = A.GetLength(0);
+
+        eval = new double[n];
+        evec = new double[n, n];
+
+        double[,] D = new double[n, n];
 
         for (int i = 0; i < n; i++)
         {
-            values[i] = PowerIteration(B);
-        }
-        return values;
-    }
-
-    private double PowerIteration(double[,] M)
-    {
-        int n = M.GetLength(0);
-        double[] b = new double[n];
-        for (int i = 0; i < n; i++) b[i] = 1.0;
-
-        for (int iter = 0; iter < 50; iter++)
-        {
-            double[] b1 = new double[n];
-            for (int i = 0; i < n; i++)
-                for (int j = 0; j < n; j++)
-                    b1[i] += M[i, j] * b[j];
-
-            double norm = Math.Sqrt(b1.Sum(v => v * v));
-            for (int i = 0; i < n; i++)
-                b[i] = b1[i] / norm;
-        }
-
-        double lambda = 0;
-        for (int i = 0; i < n; i++)
             for (int j = 0; j < n; j++)
-                lambda += b[i] * M[i, j] * b[j];
+                D[i, j] = A[i, j];
 
-        return lambda;
+            for (int j = 0; j < n; j++)
+                evec[i, j] = (i == j ? 1 : 0);
+        }
+
+        for (int iter = 0; iter < maxIter; iter++)
+        {
+            double maxVal = 0;
+            int p = 0, q = 1;
+
+            for (int i = 0; i < n; i++)
+            {
+                for (int j = i + 1; j < n; j++)
+                {
+                    double v = Math.Abs(D[i, j]);
+                    if (v > maxVal)
+                    {
+                        p = i;
+                        q = j;
+                        maxVal = v;
+                    }
+                }
+            }
+
+            if (maxVal < 1e-12) break;
+
+            double phi = 0.5 * Math.Atan2(2 * D[p, q], D[q, q] - D[p, p]);
+            double c = Math.Cos(phi);
+            double s = Math.Sin(phi);
+
+            double Dpp = c * c * D[p, p] - 2 * s * c * D[p, q] + s * s * D[q, q];
+            double Dqq = s * s * D[p, p] + 2 * s * c * D[p, q] + c * c * D[q, q];
+
+            D[p, p] = Dpp;
+            D[q, q] = Dqq;
+            D[p, q] = D[q, p] = 0;
+
+            for (int i = 0; i < n; i++)
+            {
+                if (i != p && i != q)
+                {
+                    double dip = c * D[i, p] - s * D[i, q];
+                    double diq = s * D[i, p] + c * D[i, q];
+                    D[i, p] = D[p, i] = dip;
+                    D[i, q] = D[q, i] = diq;
+                }
+
+                double vip = c * evec[i, p] - s * evec[i, q];
+                double viq = s * evec[i, p] + c * evec[i, q];
+                evec[i, p] = vip;
+                evec[i, q] = viq;
+            }
+        }
+
+        for (int i = 0; i < n; i++)
+            eval[i] = D[i, i];
+
+        return true;
     }
 
+    // ==========================================================================
+    //                         UTILITY: ACCUMULATOR
+    // ==========================================================================
+
+    private void AccumulateRowToN(double[,] N, double[] row, double weight)
+    {
+        int n = N.GetLength(0);
+
+        for (int i = 0; i < n; i++)
+        {
+            double ri = row[i];
+            if (Math.Abs(ri) < 1e-16) continue;
+
+            for (int j = 0; j < n; j++)
+            {
+                double rj = row[j];
+                if (Math.Abs(rj) < 1e-16) continue;
+
+                N[i, j] += weight * ri * rj;
+            }
+        }
+    }
 
     private bool ComputeConditionNumberSVD(out double condValue, out double[,] invN)
     {
         condValue = double.PositiveInfinity;
         invN = null;
 
-        double[,] Narr = ComputeNormalMatrix();
-        if (Narr == null) return false;
+        // Используем 3D-версию матрицы с параметром out double
+        double quality;
+        double[,] N = ComputeNormalMatrix(out quality);
+        if (N == null) return false;
 
-        int n = Narr.GetLength(0);
-        if (n == 0) return false;
+        int n = N.GetLength(0);
 
-        try
+        // Якоби-декомпозиция вместо SVD из MathNet
+        if (!JacobiEigenDecomposition(N, out double[] eig, out double[,] eigVec))
         {
-            var Nmat = DenseMatrix.OfArray(Narr);
-            var svd = Nmat.Svd(true);
-            var S = svd.S;
-
-            if (S.Minimum() < 1e-12) return false;
-
-            condValue = S.Maximum() / S.Minimum();
-
-            var Sinv = DenseMatrix.CreateDiagonal(n, n, i => S[i] > 1e-12 ? 1.0 / S[i] : 0.0);
-            var invMat = svd.VT.Transpose() * Sinv * svd.U.Transpose();
-            invN = invMat.ToArray();
-            return true;
-        }
-        catch (Exception e)
-        {
-            Debug.LogError($"Ошибка при SVD вычислении: {e.Message}");
+            Debug.LogWarning("Eigen decomposition failed.");
             return false;
         }
-    }
 
+        double minEig = double.MaxValue;
+        double maxEig = double.MinValue;
+
+        for (int i = 0; i < eig.Length; i++)
+        {
+            if (eig[i] < minEig) minEig = eig[i];
+            if (eig[i] > maxEig) maxEig = eig[i];
+        }
+
+        if (minEig <= 1e-15)
+        {
+            Debug.LogWarning("Минимальное собственное значение ~ 0 — сеть вырождена.");
+            return false;
+        }
+
+        condValue = maxEig / minEig;
+
+        // Псевдообратная матрица: N⁻¹ = V * Λ⁻¹ * Vᵀ
+        invN = new double[n, n];
+
+        for (int k = 0; k < eig.Length; k++)
+        {
+            double λinv = eig[k] > 1e-15 ? 1.0 / eig[k] : 0.0;
+
+            for (int i = 0; i < n; i++)
+            {
+                double vik = eigVec[i, k];
+                if (Math.Abs(vik) < 1e-15) continue;
+
+                for (int j = 0; j < n; j++)
+                {
+                    double vjk = eigVec[j, k];
+                    if (Math.Abs(vjk) < 1e-15) continue;
+
+                    invN[i, j] += vik * λinv * vjk;
+                }
+            }
+        }
+
+        return true;
+    }
     private List<(Vector3 pos, double cond)> SuggestStationPositions(int topK = 3)
     {
         var suggestions = new List<(Vector3 pos, double cond)>();
