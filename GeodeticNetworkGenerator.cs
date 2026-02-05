@@ -269,7 +269,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
         int populationSize = Mathf.Clamp(grades.Count * 2, 10, 30); // Увеличили популяцию
         int generations = Mathf.Clamp(grades.Count * 3, 30, 60);    // Увеличили поколения
-        float mutationRate = 0.6f;  // ВЫСОКИЙ шанс мутации для разнообразия
+        float mutationRate = 0.35f;  // стартуем умеренно, а при стагнации усиливаем
         float crossoverRate = 0.8f; // ВЫСОКИЙ шанс кроссовера
         int eliteCount = Mathf.Clamp(populationSize / 5, 3, 8); // Элитизм
 
@@ -437,13 +437,17 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             // Адаптивная мутация
             if (generationsWithoutImprovement > 10)
             {
-                float adaptiveMutationRate = Mathf.Min(0.4f, mutationRate * 1.3f);
+                float adaptiveMutationRate = Mathf.Min(0.65f, mutationRate * 1.2f);
                 if (adaptiveMutationRate != mutationRate)
                 {
                     mutationRate = adaptiveMutationRate;
                     if (generation % 5 == 0)
                         Debug.Log($"🔧 Адаптивная мутация: коэффициент увеличен до {mutationRate:F2}");
                 }
+            }
+            else if (generationsWithoutImprovement <= 3)
+            {
+                mutationRate = Mathf.Max(0.2f, mutationRate * 0.96f);
             }
 
             // СОРТИРОВКА И ЭЛИТИЗМ
@@ -480,14 +484,16 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 if (UnityEngine.Random.value < 0.5f && fitnessScores.Count >= 2)
                 {
                     // КРОССОВЕР двух родителей
-                    var parent1 = TournamentSelection(fitnessScores, 3);
-                    var parent2 = TournamentSelection(fitnessScores, 3);
+                    int tournamentSize = generationsWithoutImprovement > 8 ? 2 : 4;
+                    var parent1 = TournamentSelection(fitnessScores, tournamentSize);
+                    var parent2 = TournamentSelection(fitnessScores, tournamentSize);
                     offspring = Crossover(parent1, parent2, bounds, buildingCollider);
                 }
                 else
                 {
                     // КЛОНИРОВАНИЕ одного родителя
-                    var parent = TournamentSelection(fitnessScores, 3);
+                    int tournamentSize = generationsWithoutImprovement > 8 ? 2 : 4;
+                    var parent = TournamentSelection(fitnessScores, tournamentSize);
                     offspring = parent.Select(s => new Station
                     {
                         position = s.position,
@@ -498,7 +504,13 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 // МУТАЦИЯ потомка
                 if (offspring != null && offspring.Count > 0 && UnityEngine.Random.value < mutationRate)
                 {
-                    offspring = Mutate(offspring, 0.5f, bounds, buildingCollider, baseOffset); // 50% шанс мутации
+                    offspring = Mutate(offspring, mutationRate, bounds, buildingCollider, baseOffset);
+                }
+
+                // Локальный ремонт покрытия после операций ГА
+                if (offspring != null && offspring.Count > 0)
+                {
+                    offspring = RepairAndTrimSolution(offspring, bounds, buildingCollider, baseOffset, 10);
                 }
 
                 // БАЗОВАЯ ПРОВЕРКА: потомок должен быть валидным
@@ -552,6 +564,11 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             }
 
             population = newPopulation;
+
+            if (generationsWithoutImprovement > 12)
+            {
+                InjectDiversity(population, candidatePositions, Mathf.Max(1, populationSize / 6));
+            }
 
             // ЛОГИРОВАНИЕ ПРОГРЕССА (только каждые 5-10 поколений)
             if (generation % 10 == 0 || (generation < 10 && generation % 2 == 0))
@@ -667,7 +684,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 }
             }
 
-            return bestSolution.Where(s => s != null).ToList();
+            return RepairAndTrimSolution(bestSolution.Where(s => s != null).ToList(), bounds, buildingCollider, baseOffset, 10);
         }
         else
         {
@@ -1572,6 +1589,105 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         }
 
         return mutated;
+    }
+
+    private void InjectDiversity(List<List<Station>> population, List<Vector3> candidatePositions, int injectCount)
+    {
+        if (population == null || candidatePositions == null || candidatePositions.Count == 0 || injectCount <= 0)
+            return;
+
+        int safeInjectCount = Mathf.Min(injectCount, population.Count);
+        for (int i = 0; i < safeInjectCount; i++)
+        {
+            int replaceIdx = UnityEngine.Random.Range(Mathf.Max(1, population.Count / 2), population.Count);
+            var randomSolution = GenerateRandomSolution(candidatePositions, UnityEngine.Random.Range(0, 100000));
+            if (randomSolution != null && randomSolution.Count >= minStations)
+            {
+                population[replaceIdx] = randomSolution;
+            }
+        }
+    }
+
+    private List<Station> RepairAndTrimSolution(List<Station> solution, Bounds bounds, Collider buildingCollider, float baseOffset, int maxStations)
+    {
+        if (solution == null) return new List<Station>();
+
+        var repaired = solution
+            .Where(s => s != null)
+            .Select(s => new Station
+            {
+                position = s.position,
+                visibleGrades = s.visibleGrades != null ? new HashSet<Transform>(s.visibleGrades) : new HashSet<Transform>()
+            })
+            .ToList();
+
+        repaired.RemoveAll(s => IsInsideAnyBuilding(s.position));
+
+        for (int i = repaired.Count - 1; i >= 0; i--)
+        {
+            for (int j = i - 1; j >= 0; j--)
+            {
+                if (Vector3.Distance(repaired[i].position, repaired[j].position) < 4f)
+                {
+                    if (repaired[i].visibleGrades.Count <= repaired[j].visibleGrades.Count)
+                        repaired.RemoveAt(i);
+                    else
+                        repaired.RemoveAt(j);
+                    break;
+                }
+            }
+        }
+
+        var uncovered = new HashSet<Transform>(grades);
+        foreach (var st in repaired)
+        {
+            st.visibleGrades = GetVisibleGradesFromPos(st.position);
+            foreach (var g in st.visibleGrades) uncovered.Remove(g);
+        }
+
+        if (uncovered.Count > 0)
+        {
+            var candidates = GenerateCandidatePositions(bounds, buildingCollider, baseOffset)
+                .OrderByDescending(pos => GetVisibleGradesFromPos(pos).Count(g => uncovered.Contains(g)))
+                .Take(40)
+                .ToList();
+
+            foreach (var pos in candidates)
+            {
+                var visible = GetVisibleGradesFromPos(pos);
+                int newCoverage = visible.Count(g => uncovered.Contains(g));
+                if (newCoverage <= 0) continue;
+
+                repaired.Add(new Station { position = pos, visibleGrades = visible });
+                foreach (var g in visible) uncovered.Remove(g);
+
+                if (uncovered.Count == 0 || repaired.Count >= maxStations)
+                    break;
+            }
+        }
+
+        if (repaired.Count > maxStations)
+        {
+            repaired = repaired
+                .OrderByDescending(s => s.visibleGrades.Count)
+                .Take(maxStations)
+                .ToList();
+        }
+
+        while (repaired.Count < minStations)
+        {
+            var candidates = GenerateCandidatePositions(bounds, buildingCollider, baseOffset);
+            if (candidates.Count == 0) break;
+
+            var pos = candidates[UnityEngine.Random.Range(0, candidates.Count)];
+            var visible = GetVisibleGradesFromPos(pos);
+            if (visible.Count > 0)
+                repaired.Add(new Station { position = pos, visibleGrades = visible });
+            else
+                break;
+        }
+
+        return repaired;
     }
 
     // Резервное решение если генетический алгоритм не сработал
