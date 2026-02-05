@@ -29,7 +29,14 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     public LayerMask groundLayer;
     public LayerMask obstacleLayer;
     [Header("Ограничения количества станций")]
-    public int minStations = 3;
+    public int minStations = 4;
+    [Range(0.4f, 1.0f)] public float requiredObservationRedundancy = 0.4f;
+    [Range(2, 4)] public int minStationsPerGrade = 2;
+    [Header("Шаг 2 — закрепление пунктов")]
+    public float frostDepthMeters = 1.7f;
+    public float minExternalAnchorDepthMeters = 2.5f;
+    [Tooltip("Защитная полоса от здания, воды и зоны вибраций")]
+    public float restrictedZoneBuffer = 4.0f;
     [Header("py файл (указываем через Inspector)")]
     [Header("СКО")]
     public TMP_InputField directionStdevInput;
@@ -139,8 +146,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     public void OnGenerateButtonPressed()
     {
         GenerateNetwork();
-        ExportXML(); // 
-        RunPython(); // 
+        ExportXML(); //
+        RunPython(); //
         PrintNetworkReport();
         ExportStationsToCSV();
 
@@ -171,6 +178,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             return;
         }
 
+        Debug.Log($"Требуемая глубина закрепления опорных пунктов: ≥{RequiredAnchorDepthMeters():F2} м");
+
         // Генетический алгоритм для поиска оптимальной конфигурации станций
         List<Station> bestSolution = RunGeneticAlgorithm();
 
@@ -198,19 +207,24 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 return false;
         }
 
-        // 2. Упрощённая проверка покрытия: хотя бы 80% марок должны быть видны
+        // 2. Проверка покрытия и избыточности (Шаг 4)
         var covered = new HashSet<Transform>();
+        var observationCount = new Dictionary<Transform, int>();
+        foreach (var grade in grades) observationCount[grade] = 0;
+
         foreach (var s in solution)
         {
             foreach (var grade in s.visibleGrades)
             {
                 covered.Add(grade);
+                if (observationCount.ContainsKey(grade)) observationCount[grade]++;
             }
         }
 
-        // УСПОКОИЛИ условие: достаточно 80% покрытия
         float coverageRatio = (float)covered.Count / grades.Count;
-        return coverageRatio >= 0.8f; // Было: coverageRatio == 1.0f
+        int wellObserved = observationCount.Values.Count(v => v >= minStationsPerGrade);
+        float wellObservedRatio = (float)wellObserved / grades.Count;
+        return coverageRatio >= 0.95f && wellObservedRatio >= requiredObservationRedundancy;
     }
     private Dictionary<Vector3Int, HashSet<Transform>> visibilityCache = new Dictionary<Vector3Int, HashSet<Transform>>();
     private void ClearCache()
@@ -1121,9 +1135,10 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 // Быстрая проверка на нахождение в здании
                 if (!IsInsideAnyBuilding(groundPos))
                 {
-                    // Проверяем минимальное расстояние до стены
+                    // Шаг 2: размещаем внешние пункты вне зоны влияния объекта
                     Vector3 wallPoint = buildingCollider.ClosestPoint(groundPos);
-                    if (Vector3.Distance(groundPos, wallPoint) > 3.0f) // Уменьшен минимум
+                    float perimeterClearance = GetRestrictedPerimeterDistance(bounds);
+                    if (Vector3.Distance(groundPos, wallPoint) > perimeterClearance)
                     {
                         candidates.Add(groundPos);
                     }
@@ -1159,7 +1174,11 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
                             if (!IsInsideAnyBuilding(groundPos))
                             {
-                                candidates.Add(groundPos);
+                                Vector3 wallPoint = buildingCollider.ClosestPoint(groundPos);
+                                if (Vector3.Distance(groundPos, wallPoint) > GetRestrictedPerimeterDistance(bounds) * 0.8f)
+                                {
+                                    candidates.Add(groundPos);
+                                }
                             }
                         }
                     }
@@ -1192,11 +1211,29 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     {
         // УМЕНЬШАЕМ расстояния для более близкого размещения
         float buildingSize = bounds.size.magnitude;
-        float minDistance = Mathf.Max(buildingSize * 0.1f, 6f);  // 
-        float maxDistance = Mathf.Max(buildingSize * 0.3f, 12f); // 
+        float minDistance = Mathf.Max(buildingSize * 0.1f, 6f);  //
+        float maxDistance = Mathf.Max(buildingSize * 0.3f, 12f); //
 
         Debug.Log($"Размер здания: {buildingSize:F1}m, оптимальное расстояние: {minDistance:F1}-{maxDistance:F1}m");
         return (minDistance + maxDistance) / 2f;
+    }
+
+    private float RequiredAnchorDepthMeters()
+    {
+        return Mathf.Max(minExternalAnchorDepthMeters, 1.5f * frostDepthMeters);
+    }
+
+    private float GetRestrictedPerimeterDistance(Bounds bounds)
+    {
+        float footprint = Mathf.Max(bounds.extents.x, bounds.extents.z);
+        return Mathf.Max(restrictedZoneBuffer, footprint * 0.25f);
+    }
+
+    private float CalculateRequiredObservationCount()
+    {
+        int unknownParameters = Mathf.Max(1, grades.Count * 2);
+        int minObservations = Mathf.CeilToInt(unknownParameters / (1f - requiredObservationRedundancy));
+        return Mathf.Max(minObservations, grades.Count * minStationsPerGrade);
     }
 
     // Расчет приспособленности решения
@@ -1211,6 +1248,10 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         foreach (var station in solution)
         {
             if (IsInsideAnyBuilding(station.position))
+                return DEAD_PENALTY;
+
+            Vector3 wallPoint = buildingCollider.ClosestPoint(station.position);
+            if (Vector3.Distance(station.position, wallPoint) < GetRestrictedPerimeterDistance(bounds) * 0.8f)
                 return DEAD_PENALTY;
         }
 
@@ -1252,39 +1293,45 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             }
         }
 
-        // ================== 4. ПРОВЕРКА РЕДУНДАНТНОСТИ (минимум 2 наблюдения на марку) ==================
+        // ================== 4. ПРОВЕРКА РЕДУНДАНТНОСТИ (Шаг 4) ==================
         int wellObservedGrades = 0;
+        int totalObservations = 0;
         foreach (var count in gradeObservationCount.Values)
         {
-            if (count >= 2)
+            totalObservations += count;
+            if (count >= minStationsPerGrade)
                 wellObservedGrades++;
         }
 
-        float redundancyRatio = (float)wellObservedGrades / grades.Count;
+        float redundancyRatio = grades.Count > 0 ? (float)wellObservedGrades / grades.Count : 0f;
+        float achievedObservationRatio = grades.Count > 0
+            ? totalObservations / Mathf.Max(1f, CalculateRequiredObservationCount())
+            : 0f;
 
-        // ЖЁСТКОЕ ТРЕБОВАНИЕ: все марки должны быть видны из ≥2 станций
-        if (redundancyRatio < 1.0f)
+        if (redundancyRatio < requiredObservationRedundancy)
         {
             float partialFitness = redundancyRatio * 50000f;
-            partialFitness -= (1.0f - redundancyRatio) * 20000f;
-            partialFitness -= solution.Count * 3000f;
+            partialFitness += achievedObservationRatio * 15000f;
+            partialFitness -= (requiredObservationRedundancy - redundancyRatio) * 60000f;
+            partialFitness -= solution.Count * 3500f;
             return partialFitness;
         }
 
         // ================== 5. ГЛАВНЫЙ ФИТНЕС: ПОЛНОЕ ПОКРЫТИЕ + РЕДУНДАНТНОСТЬ ==================
         float fitness = 100000f;
+        fitness += achievedObservationRatio * 12000f;
 
         // ================== 6. МИНИМИЗАЦИЯ КОЛИЧЕСТВА СТАНЦИЙ ==================
-        int optimalCount = Mathf.Max(minStations, Mathf.CeilToInt(grades.Count / 2.0f));
+        int optimalCount = Mathf.Max(minStations, Mathf.CeilToInt(grades.Count / 2.2f));
 
         if (solution.Count > optimalCount)
         {
             int excessStations = solution.Count - optimalCount;
-            fitness -= excessStations * 30000f;
+            fitness -= excessStations * 18000f;
         }
         else if (solution.Count < optimalCount)
         {
-            fitness += (optimalCount - solution.Count) * 10000f;
+            fitness += (optimalCount - solution.Count) * 6000f;
         }
 
         // ================== 7. ПРОВЕРКА УГЛОВ НАБЛЮДЕНИЯ (3D) ==================
@@ -1375,6 +1422,13 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         fitness += visiblePairs * 400f;
         if (visiblePairs >= solution.Count - 1)
             fitness += 10000f;
+
+        // Шаг 4: предпочтение замкнутому полигону опорных пунктов
+        int minimumPairsForClosedPolygon = solution.Count;
+        if (visiblePairs >= minimumPairsForClosedPolygon)
+            fitness += 15000f;
+        else
+            fitness -= 18000f;
 
         // Штраф за дублирующее покрытие
         for (int i = 0; i < solution.Count; i++)
@@ -2700,7 +2754,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 N[s1_idx * 3 + 2, s1_idx * 3 + 1] += w_scale * dz * dy;
                 N[s1_idx * 3 + 2, s1_idx * 3 + 2] += w_scale * dz * dz;
 
-                // Станция 2  
+                // Станция 2
                 N[s2_idx * 3 + 0, s2_idx * 3 + 0] += w_scale * dx * dx;
                 N[s2_idx * 3 + 0, s2_idx * 3 + 1] += w_scale * dx * dy;
                 N[s2_idx * 3 + 0, s2_idx * 3 + 2] += w_scale * dx * dz;
