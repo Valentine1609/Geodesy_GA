@@ -218,6 +218,15 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         if (visibilityCache != null)
             visibilityCache.Clear();
     }
+
+    private static void ShuffleInPlace<T>(IList<T> list)
+    {
+        for (int i = list.Count - 1; i > 0; i--)
+        {
+            int j = UnityEngine.Random.Range(0, i + 1);
+            (list[i], list[j]) = (list[j], list[i]);
+        }
+    }
     private HashSet<Transform> GetCachedVisibleGrades(Vector3 pos)
     {
         // Округляем позицию для ключа кэша
@@ -291,8 +300,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         // ОГРАНИЧИВАЕМ количество кандидатов при большом количестве марок
         if (candidatePositions.Count > 80)
         {
+            ShuffleInPlace(candidatePositions);
             candidatePositions = candidatePositions
-                .OrderBy(x => UnityEngine.Random.value)
                 .Take(80)
                 .ToList();
             Debug.Log($"Ограничено количество кандидатов до {candidatePositions.Count}");
@@ -527,10 +536,11 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 int stationCount = UnityEngine.Random.Range(minStations, Mathf.Min(8, candidatePositions.Count));
                 var randomSolution = new List<Station>();
 
-                var shuffled = candidatePositions.OrderBy(x => UnityEngine.Random.value).ToList();
+                var shuffled = new List<Vector3>(candidatePositions);
+                ShuffleInPlace(shuffled);
                 for (int i = 0; i < stationCount && i < shuffled.Count; i++)
                 {
-                    var visible = GetVisibleGradesFromPos(shuffled[i]);
+                    var visible = GetCachedVisibleGrades(shuffled[i]);
                     if (visible.Count > 0)
                     {
                         randomSolution.Add(new Station
@@ -846,7 +856,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         while (uncoveredGrades.Count > 0 && solution.Count < 12 && availableCandidates.Count > 0)
         {
             // Перемешиваем кандидатов для разнообразия
-            availableCandidates = availableCandidates.OrderBy(x => UnityEngine.Random.value).ToList();
+            ShuffleInPlace(availableCandidates);
 
             int bestIdx = -1;
             int bestNew = 0;
@@ -894,7 +904,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             Mathf.Min(8, candidatePositions.Count) + 1
         );
 
-        var shuffled = candidatePositions.OrderBy(x => UnityEngine.Random.value).ToList();
+        var shuffled = new List<Vector3>(candidatePositions);
+        ShuffleInPlace(shuffled);
         var solution = new List<Station>();
 
         for (int i = 0; i < stationCount && i < shuffled.Count; i++)
@@ -1050,7 +1061,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     {
         // Создаем минимальное решение: 3 станции, максимально покрывающие марки
         var solution = new List<Station>();
-        var shuffled = candidatePositions.OrderBy(x => UnityEngine.Random.value).ToList();
+        var shuffled = new List<Vector3>(candidatePositions);
+        ShuffleInPlace(shuffled);
 
         for (int i = 0; i < Mathf.Min(3, shuffled.Count) && solution.Count < minStations; i++)
         {
