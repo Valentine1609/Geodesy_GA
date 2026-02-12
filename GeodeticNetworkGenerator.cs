@@ -141,8 +141,6 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
     }
 
-
-    // ЗАМЕНИТЕ существующий метод GenerateNetwork на этот:
     private void GenerateNetwork()
     {
         if (networkPrefab == null || targetBuilding == null)
@@ -182,8 +180,6 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     private Dictionary<Vector3Int, HashSet<Transform>> visibilityCache = new Dictionary<Vector3Int, HashSet<Transform>>();
 
 
-    // ДОБАВЬТЕ эти методы для генетического алгоритма:
-
     // Основной метод генетического алгоритма
     private List<Station> RunGeneticAlgorithm()
     {
@@ -214,8 +210,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         // ЗАЩИТА: убеждаемся, что stationCountFactor не равен нулю
         if (stationCountFactor <= 0) stationCountFactor = 1f;
 
-        int populationSize = Mathf.Clamp(grades.Count * 2, 10, 30); // Увеличили популяцию
-        int generations = Mathf.Clamp(grades.Count * 3, 30, 60);    // Увеличили поколения
+        int populationSize = Mathf.Clamp(grades.Count * 2, 10, 30); //  популяция
+        int generations = Mathf.Clamp(grades.Count * 3, 30, 60);    // поколение
         float mutationRate = 0.6f;  // ВЫСОКИЙ шанс мутации для разнообразия
         float crossoverRate = 0.8f; // ВЫСОКИЙ шанс кроссовера
         int eliteCount = Mathf.Clamp(populationSize / 5, 3, 8); // Элитизм
@@ -1236,7 +1232,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             bool isDuplicate = false;
             foreach (var unique in uniqueCandidates)
             {
-                if (Vector3.Distance(candidate, unique) < 5f) // Увеличен порог
+                if (Vector3.Distance(candidate, unique) < 5f) // порог
                 {
                     isDuplicate = true;
                     break;
@@ -1254,8 +1250,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     {
         // УМЕНЬШАЕМ расстояния для более близкого размещения
         float buildingSize = bounds.size.magnitude;
-        float minDistance = Mathf.Max(buildingSize * 0.1f, 6f);  // 
-        float maxDistance = Mathf.Max(buildingSize * 0.3f, 12f); // 
+        float minDistance = Mathf.Max(buildingSize * 0.1f, 6f); 
+        float maxDistance = Mathf.Max(buildingSize * 0.3f, 12f); 
 
         Debug.Log($"Размер здания: {buildingSize:F1}m, оптимальное расстояние: {minDistance:F1}-{maxDistance:F1}m");
         return (minDistance + maxDistance) / 2f;
