@@ -752,104 +752,64 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
         Debug.Log($"Генерация начальной популяции: {populationSize} особей, {candidatePositions.Count} кандидатов, {grades.Count} марок");
 
-        // ================== 1. РАЗНООБРАЗНЫЕ СТРАТЕГИИ ГЕНЕРАЦИИ ==================
+        // ================== 1. ЧЕТКИЙ ЖАДНЫЙ СТАРТ (1-3 особи) ==================
+        int greedySeedCount = Mathf.Clamp(populationSize / 8, 1, 3);
 
-        // Определяем, сколько особей создавать каждой стратегией
-        int greedyCount = Mathf.Max(2, populationSize / 5);      // 20% - жадные решения
-        int randomCount = Mathf.Max(3, populationSize / 4);      // 25% - случайные решения
-        int geometricCount = Mathf.Max(2, populationSize / 6);   // ~17% - геометрические решения
-        int uniformCount = Mathf.Max(2, populationSize / 6);     // ~17% - равномерное распределение
-        int restCount = populationSize - greedyCount - randomCount - geometricCount - uniformCount; // Остальные - смешанные
-
-        // ================== 2. ГЕНЕРАЦИЯ ЖАДНЫХ РЕШЕНИЙ (максимальное покрытие) ==================
-        for (int i = 0; i < greedyCount && population.Count < populationSize; i++)
+        for (int i = 0; i < greedySeedCount && population.Count < populationSize; i++)
         {
             var greedySolution = GenerateGreedySolution(candidatePositions, i);
             if (greedySolution != null && greedySolution.Count >= minStations)
             {
                 population.Add(greedySolution);
-                Debug.Log($"Жадное решение {i + 1}: {greedySolution.Count} станций");
+                Debug.Log($"Жадный seed {i + 1}: {greedySolution.Count} станций");
             }
         }
 
-        // ================== 3. ГЕНЕРАЦИЯ СЛУЧАЙНЫХ РЕШЕНИЙ (разнообразие) ==================
-        for (int i = 0; i < randomCount && population.Count < populationSize; i++)
+        if (population.Count == 0)
         {
-            var randomSolution = GenerateRandomSolution(candidatePositions, i);
-            if (randomSolution != null && randomSolution.Count >= minStations)
+            var minimalSolution = CreateMinimalSolution(candidatePositions);
+            if (minimalSolution != null && minimalSolution.Count >= minStations)
             {
-                population.Add(randomSolution);
-                Debug.Log($"Случайное решение {i + 1}: {randomSolution.Count} станций");
+                population.Add(minimalSolution);
+                Debug.LogWarning("Жадный seed не найден, добавлено минимальное решение");
             }
         }
 
-        // ================== 4. ГЕНЕРАЦИЯ ГЕОМЕТРИЧЕСКИХ РЕШЕНИЙ (оптимальные углы) ==================
-        for (int i = 0; i < geometricCount && population.Count < populationSize; i++)
+        // ================== 2. ОСТАЛЬНЫЕ ОСОБИ = МУТАЦИИ ОТ ЖАДНЫХ ==================
+        if (population.Count == 0)
+            return population;
+
+        int mutationAttempts = 0;
+        while (population.Count < populationSize && mutationAttempts < populationSize * 8)
         {
-            var geometricSolution = GenerateGeometricSolution(candidatePositions, i);
-            if (geometricSolution != null && geometricSolution.Count >= minStations)
+            mutationAttempts++;
+            var baseSeed = population[UnityEngine.Random.Range(0, population.Count)];
+            var mutated = Mutate(baseSeed, 0.85f, GetObjectBounds(targetBuilding), targetBuilding.GetComponent<Collider>(), CalculateOptimalDistance(GetObjectBounds(targetBuilding)));
+
+            if (mutated != null && mutated.Count >= minStations)
             {
-                population.Add(geometricSolution);
-                Debug.Log($"Геометрическое решение {i + 1}: {geometricSolution.Count} станций");
+                population.Add(mutated);
             }
         }
 
-        // ================== 5. ГЕНЕРАЦИЯ РАВНОМЕРНЫХ РЕШЕНИЙ (баланс распределения) ==================
-        for (int i = 0; i < uniformCount && population.Count < populationSize; i++)
-        {
-            var uniformSolution = GenerateUniformSolution(candidatePositions, i);
-            if (uniformSolution != null && uniformSolution.Count >= minStations)
-            {
-                population.Add(uniformSolution);
-                Debug.Log($"Равномерное решение {i + 1}: {uniformSolution.Count} станций");
-            }
-        }
-
-        // ================== 6. ДОПОЛНЕНИЕ СМЕШАННЫМИ РЕШЕНИЯМИ ==================
+        // ================== 3. ДОПОЛНЕНИЕ ЖАДНЫМИ, ЕСЛИ МУТАЦИЙ НЕ ХВАТИЛО ==================
         while (population.Count < populationSize)
         {
-            int strategy = UnityEngine.Random.Range(0, 4);
-            List<Station> mixedSolution = null;
-
-            switch (strategy)
+            var greedySolution = GenerateGreedySolution(candidatePositions, population.Count);
+            if (greedySolution != null && greedySolution.Count >= minStations)
             {
-                case 0:
-                    mixedSolution = GenerateGreedySolution(candidatePositions, population.Count);
-                    break;
-                case 1:
-                    mixedSolution = GenerateRandomSolution(candidatePositions, population.Count);
-                    break;
-                case 2:
-                    mixedSolution = GenerateGeometricSolution(candidatePositions, population.Count);
-                    break;
-                case 3:
-                    mixedSolution = GenerateUniformSolution(candidatePositions, population.Count);
-                    break;
-            }
-
-            if (mixedSolution != null && mixedSolution.Count >= minStations)
-            {
-                population.Add(mixedSolution);
+                population.Add(greedySolution);
             }
             else
             {
-                // Последняя попытка: создать минимальное решение
-                var minimalSolution = CreateMinimalSolution(candidatePositions);
-                if (minimalSolution != null && minimalSolution.Count >= minStations)
-                {
-                    population.Add(minimalSolution);
-                    Debug.Log($"Минимальное решение: {minimalSolution.Count} станций");
-                }
+                break;
             }
-
-            // Защита от бесконечного цикла
-            if (population.Count >= populationSize * 2) break;
         }
 
-        // ================== 7. УДАЛЕНИЕ ДУБЛИКАТОВ ==================
+        // ================== 4. УДАЛЕНИЕ ДУБЛИКАТОВ ==================
         population = RemoveDuplicateSolutions(population);
 
-        // ================== 8. ОБЕСПЕЧЕНИЕ МИНИМАЛЬНОГО РАЗМЕРА ПОПУЛЯЦИИ ==================
+        // ================== 5. ОБЕСПЕЧЕНИЕ МИНИМАЛЬНОГО РАЗМЕРА ПОПУЛЯЦИИ ==================
         while (population.Count < Mathf.Min(populationSize, 5))
         {
             Debug.LogWarning($"Популяция слишком мала ({population.Count}), добавляем случайные решения");
@@ -861,7 +821,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         }
 
         Debug.Log($"✅ Начальная популяция сгенерирована: {population.Count} особей " +
-                 $"(жадных: {greedyCount}, случайных: {randomCount}, геометрических: {geometricCount})");
+                 $"(жадных seed: {greedySeedCount}, остальные - мутации)");
 
         return population;
     }
@@ -876,18 +836,18 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         var uncoveredGrades = new HashSet<Transform>(grades);
         var availableCandidates = new List<Vector3>(candidatePositions);
 
-        // Первая станция: лучший кандидат по покрытию
+        // Первая станция: лучший кандидат по покрытию + геометрии
         Vector3? bestFirstPos = null;
         HashSet<Transform> bestFirstCoverage = null;
-        int bestFirstCount = 0;
+        float bestFirstScore = float.MinValue;
 
         foreach (var pos in availableCandidates)
         {
             var coverage = GetVisibleGradesFromPos(pos);
-            int newCount = coverage.Count(g => uncoveredGrades.Contains(g));
-            if (newCount > bestFirstCount)
+            float score = ScoreGreedyCandidate(pos, coverage, solution, uncoveredGrades);
+            if (score > bestFirstScore)
             {
-                bestFirstCount = newCount;
+                bestFirstScore = score;
                 bestFirstPos = pos;
                 bestFirstCoverage = coverage;
             }
@@ -907,25 +867,25 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             availableCandidates = availableCandidates.OrderBy(x => UnityEngine.Random.value).ToList();
 
             int bestIdx = -1;
-            int bestNew = 0;
+            float bestScore = float.MinValue;
             HashSet<Transform> bestCoverage = null;
 
-            // Ищем кандидата, который покрывает больше всего непокрытых марок
+            // Ищем кандидата, который усиливает покрытие, избыточность и геометрию
             for (int i = 0; i < Mathf.Min(50, availableCandidates.Count); i++) // Ограничиваем проверку
             {
                 var pos = availableCandidates[i];
                 var coverage = GetVisibleGradesFromPos(pos);
-                int newCount = coverage.Count(g => uncoveredGrades.Contains(g));
+                float score = ScoreGreedyCandidate(pos, coverage, solution, uncoveredGrades);
 
-                if (newCount > bestNew)
+                if (score > bestScore)
                 {
-                    bestNew = newCount;
+                    bestScore = score;
                     bestIdx = i;
                     bestCoverage = coverage;
                 }
             }
 
-            if (bestIdx >= 0 && bestCoverage != null)
+            if (bestIdx >= 0 && bestCoverage != null && bestScore > 0f)
             {
                 var bestPos = availableCandidates[bestIdx];
                 solution.Add(new Station { position = bestPos, visibleGrades = bestCoverage });
@@ -939,7 +899,100 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             }
         }
 
+        if (!IsStationGraphConnected(solution))
+            return null;
+
         return solution.Count >= minStations ? solution : null;
+    }
+
+    private float ScoreGreedyCandidate(
+        Vector3 candidatePos,
+        HashSet<Transform> candidateCoverage,
+        List<Station> currentSolution,
+        HashSet<Transform> uncoveredGrades)
+    {
+        if (candidateCoverage == null || candidateCoverage.Count == 0)
+            return float.MinValue;
+
+        float score = 0f;
+
+        // 1) Новое покрытие имеет максимальный приоритет
+        int newCoverage = candidateCoverage.Count(g => uncoveredGrades.Contains(g));
+        score += newCoverage * 120f;
+
+        // 2) Поощряем 2+ наблюдателя для каждой марки
+        foreach (var grade in candidateCoverage)
+        {
+            int currentObservers = currentSolution.Count(s => s.visibleGrades != null && s.visibleGrades.Contains(grade));
+            if (currentObservers == 0) score += 40f;
+            if (currentObservers == 1) score += 90f;
+            if (currentObservers >= 2) score += 10f;
+        }
+
+        // 3) Стремимся к противоположным направлениям станция-марка
+        foreach (var grade in candidateCoverage)
+        {
+            foreach (var station in currentSolution)
+            {
+                if (station.visibleGrades == null || !station.visibleGrades.Contains(grade))
+                    continue;
+
+                Vector3 d1 = (station.position - grade.position).normalized;
+                Vector3 d2 = (candidatePos - grade.position).normalized;
+                float angle = Vector3.Angle(d1, d2);
+
+                score += (angle / 180f) * 70f;
+                if (angle >= 120f) score += 50f;
+                if (angle < 45f) score -= 120f;
+            }
+        }
+
+        // 4) Сеть станций должна иметь прямую видимость
+        if (currentSolution.Count > 0)
+        {
+            int visibleStations = 0;
+            foreach (var st in currentSolution)
+            {
+                if (HasLineOfSight(candidatePos, st.position))
+                    visibleStations++;
+            }
+
+            if (visibleStations == 0) return float.MinValue;
+            score += visibleStations * 60f;
+            if (visibleStations == currentSolution.Count) score += 120f;
+        }
+
+        return score;
+    }
+
+    private bool IsStationGraphConnected(List<Station> solution)
+    {
+        if (solution == null || solution.Count <= 1)
+            return true;
+
+        var queue = new Queue<int>();
+        var visited = new HashSet<int>();
+        queue.Enqueue(0);
+        visited.Add(0);
+
+        while (queue.Count > 0)
+        {
+            int i = queue.Dequeue();
+
+            for (int j = 0; j < solution.Count; j++)
+            {
+                if (i == j || visited.Contains(j))
+                    continue;
+
+                if (HasLineOfSight(solution[i].position, solution[j].position))
+                {
+                    visited.Add(j);
+                    queue.Enqueue(j);
+                }
+            }
+        }
+
+        return visited.Count == solution.Count;
     }
 
     private List<Station> GenerateRandomSolution(List<Vector3> candidatePositions, int seed)
@@ -1367,7 +1420,11 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             }
         }
 
-        // ================== 4. ПРОВЕРКА РЕДУНДАНТНОСТИ (минимум 2 наблюдения на марку) ==================
+        // ================== 4. ТРЕБОВАНИЕ СВЯЗНОСТИ СЕТИ СТАНЦИЙ ==================
+        if (!IsStationGraphConnected(solution))
+            return DEAD_PENALTY * 0.5f;
+
+        // ================== 5. ПРОВЕРКА РЕДУНДАНТНОСТИ (минимум 2 наблюдения на марку) ==================
         int wellObservedGrades = 0;
         foreach (var count in gradeObservationCount.Values)
         {
@@ -1386,10 +1443,10 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             return partialFitness;
         }
 
-        // ================== 5. ГЛАВНЫЙ ФИТНЕС: ПОЛНОЕ ПОКРЫТИЕ + РЕДУНДАНТНОСТЬ ==================
+        // ================== 6. ГЛАВНЫЙ ФИТНЕС: ПОЛНОЕ ПОКРЫТИЕ + РЕДУНДАНТНОСТЬ ==================
         float fitness = 100000f;
 
-        // ================== 6. МИНИМИЗАЦИЯ КОЛИЧЕСТВА СТАНЦИЙ ==================
+        // ================== 7. МИНИМИЗАЦИЯ КОЛИЧЕСТВА СТАНЦИЙ ==================
         int optimalCount = Mathf.Max(minStations, Mathf.CeilToInt(grades.Count / 2.0f));
 
         if (solution.Count > optimalCount)
@@ -1402,7 +1459,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             fitness += (optimalCount - solution.Count) * 10000f;
         }
 
-        // ================== 7. ПРОВЕРКА УГЛОВ НАБЛЮДЕНИЯ (3D) ==================
+        // ================== 8. ПРОВЕРКА УГЛОВ НАБЛЮДЕНИЯ (3D) ==================
         int marksWithGoodAngles = 0;
         float totalMinAngle = 0f;
 
@@ -1456,7 +1513,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             else if (avgMinAngle < 45f) fitness -= 20000f;
         }
 
-        // ================== 8. РАСПРЕДЕЛЕНИЕ ПО КВАДРАНТАМ ==================
+        // ================== 9. РАСПРЕДЕЛЕНИЕ ПО КВАДРАНТАМ ==================
         if (solution.Count >= 3)
         {
             Vector3 center = bounds.center;
@@ -1483,7 +1540,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 fitness -= 50000f;
         }
 
-        // ================== 9. СВЯЗНОСТЬ И УНИКАЛЬНОСТЬ ==================
+        // ================== 10. СВЯЗНОСТЬ И УНИКАЛЬНОСТЬ ==================
         int visiblePairs = 0;
         for (int i = 0; i < solution.Count; i++)
         {
@@ -1494,8 +1551,13 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             }
         }
         fitness += visiblePairs * 400f;
-        if (visiblePairs >= solution.Count - 1)
-            fitness += 10000f;
+        int totalPairs = solution.Count * (solution.Count - 1) / 2;
+        if (visiblePairs == totalPairs)
+            fitness += 20000f;
+        else if (visiblePairs >= solution.Count - 1)
+            fitness += 5000f;
+        else
+            fitness -= 30000f;
 
         // Штраф за дублирующее покрытие
         for (int i = 0; i < solution.Count; i++)
@@ -1509,7 +1571,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             }
         }
 
-        // ================== 10. ФИНАЛЬНЫЙ ШТРАФ/БОНУС ==================
+        // ================== 11. ФИНАЛЬНЫЙ ШТРАФ/БОНУС ==================
         fitness -= solution.Count * 3000f;
         if (solution.Count <= optimalCount)
             fitness += 50000f;
