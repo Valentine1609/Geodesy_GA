@@ -833,49 +833,24 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         UnityEngine.Random.InitState(seed + System.DateTime.Now.Millisecond);
 
         var solution = new List<Station>();
-        var uncoveredGrades = new HashSet<Transform>(grades);
+        var observationCount = grades.ToDictionary(g => g, g => 0);
+        var underObservedGrades = new HashSet<Transform>(grades);
         var availableCandidates = new List<Vector3>(candidatePositions);
 
-        // Первая станция: лучший кандидат по покрытию + геометрии
-        Vector3? bestFirstPos = null;
-        HashSet<Transform> bestFirstCoverage = null;
-        float bestFirstScore = float.MinValue;
-
-        foreach (var pos in availableCandidates)
+        // Жадно добираем станции, пока каждая марка не имеет минимум 2 наблюдателей
+        while (underObservedGrades.Count > 0 && solution.Count < 12 && availableCandidates.Count > 0)
         {
-            var coverage = GetVisibleGradesFromPos(pos);
-            float score = ScoreGreedyCandidate(pos, coverage, solution, uncoveredGrades);
-            if (score > bestFirstScore)
-            {
-                bestFirstScore = score;
-                bestFirstPos = pos;
-                bestFirstCoverage = coverage;
-            }
-        }
-
-        if (bestFirstPos.HasValue && bestFirstCoverage != null)
-        {
-            solution.Add(new Station { position = bestFirstPos.Value, visibleGrades = bestFirstCoverage });
-            foreach (var g in bestFirstCoverage) uncoveredGrades.Remove(g);
-            availableCandidates.Remove(bestFirstPos.Value);
-        }
-
-        // Жадное добавление станций, пока не покроем все марки или не достигнем максимума
-        while (uncoveredGrades.Count > 0 && solution.Count < 12 && availableCandidates.Count > 0)
-        {
-            // Перемешиваем кандидатов для разнообразия
             availableCandidates = availableCandidates.OrderBy(x => UnityEngine.Random.value).ToList();
 
             int bestIdx = -1;
             float bestScore = float.MinValue;
             HashSet<Transform> bestCoverage = null;
 
-            // Ищем кандидата, который усиливает покрытие, избыточность и геометрию
-            for (int i = 0; i < Mathf.Min(50, availableCandidates.Count); i++) // Ограничиваем проверку
+            for (int i = 0; i < Mathf.Min(60, availableCandidates.Count); i++)
             {
                 var pos = availableCandidates[i];
                 var coverage = GetVisibleGradesFromPos(pos);
-                float score = ScoreGreedyCandidate(pos, coverage, solution, uncoveredGrades);
+                float score = ScoreGreedyCandidate(pos, coverage, solution, underObservedGrades);
 
                 if (score > bestScore)
                 {
@@ -885,19 +860,25 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 }
             }
 
-            if (bestIdx >= 0 && bestCoverage != null && bestScore > 0f)
-            {
-                var bestPos = availableCandidates[bestIdx];
-                solution.Add(new Station { position = bestPos, visibleGrades = bestCoverage });
+            if (bestIdx < 0 || bestCoverage == null || bestScore <= 0f)
+                break;
 
-                foreach (var g in bestCoverage) uncoveredGrades.Remove(g);
-                availableCandidates.RemoveAt(bestIdx);
-            }
-            else
+            var bestPos = availableCandidates[bestIdx];
+            solution.Add(new Station { position = bestPos, visibleGrades = bestCoverage });
+            availableCandidates.RemoveAt(bestIdx);
+
+            foreach (var grade in bestCoverage)
             {
-                break; // Не нашли полезных кандидатов
+                if (!observationCount.ContainsKey(grade)) continue;
+                observationCount[grade]++;
+                if (observationCount[grade] >= 2)
+                    underObservedGrades.Remove(grade);
             }
         }
+
+        // Жесткое требование: каждая марка наблюдается минимум из 2 станций
+        if (underObservedGrades.Count > 0)
+            return null;
 
         if (!IsStationGraphConnected(solution))
             return null;
@@ -1173,7 +1154,13 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             }
         }
 
-        return solution.Count >= minStations ? solution : null;
+        if (solution.Count < minStations)
+            return null;
+
+        if (CountMarksWithAtLeastTwoObservers(solution) < grades.Count)
+            return null;
+
+        return solution;
     }
 
     private List<List<Station>> RemoveDuplicateSolutions(List<List<Station>> population)
@@ -1762,21 +1749,21 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     {
         Debug.LogWarning("Используется усиленное резервное решение");
         var solution = new List<Station>();
-        var uncoveredGrades = new HashSet<Transform>(grades);
+        var observationCount = grades.ToDictionary(g => g, g => 0);
+        var underObservedGrades = new HashSet<Transform>(grades);
         var candidatePositions = GenerateCandidatePositions(bounds, buildingCollider, baseOffset);
 
-        // Жадный алгоритм: добавляем станции пока не покроем все марки
-        while (uncoveredGrades.Count > 0 && candidatePositions.Count > 0)
+        // Жадный fallback: добираем станции, пока каждая марка не получит минимум 2 наблюдения
+        while (underObservedGrades.Count > 0 && candidatePositions.Count > 0)
         {
-            // Находим позицию, которая покрывает больше всего непокрытых марок
             Vector3 bestPos = candidatePositions[0];
             var bestCoverage = GetVisibleGradesFromPos(bestPos);
-            int bestCoveredCount = bestCoverage.Count(g => uncoveredGrades.Contains(g));
+            int bestCoveredCount = bestCoverage.Count(g => underObservedGrades.Contains(g));
 
             foreach (var pos in candidatePositions.Skip(1))
             {
                 var coverage = GetVisibleGradesFromPos(pos);
-                int coveredCount = coverage.Count(g => uncoveredGrades.Contains(g));
+                int coveredCount = coverage.Count(g => underObservedGrades.Contains(g));
                 if (coveredCount > bestCoveredCount)
                 {
                     bestPos = pos;
@@ -1790,25 +1777,27 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 solution.Add(new Station { position = bestPos, visibleGrades = bestCoverage });
                 foreach (var grade in bestCoverage)
                 {
-                    uncoveredGrades.Remove(grade);
+                    if (!observationCount.ContainsKey(grade)) continue;
+                    observationCount[grade]++;
+                    if (observationCount[grade] >= 2)
+                        underObservedGrades.Remove(grade);
                 }
-                Debug.Log($"Fallback: добавлена станция, покрыто {bestCoveredCount} новых марок");
+                Debug.Log($"Fallback: добавлена станция, повышено покрытие {bestCoveredCount} марок до требуемого минимума");
             }
 
             candidatePositions.Remove(bestPos);
 
-            // Защита от бесконечного цикла
-            if (solution.Count > 15) break;
+            if (solution.Count > 20) break;
         }
 
-        if (uncoveredGrades.Count == 0)
+        if (underObservedGrades.Count == 0)
         {
-            Debug.Log("✅ Fallback решение покрыло ВСЕ марки!");
+            Debug.Log("✅ Fallback решение дало минимум 2 наблюдения на каждую марку!");
         }
         else
         {
-            Debug.LogError($"❌ Fallback не смог покрыть {uncoveredGrades.Count} марок: " +
-                          string.Join(", ", uncoveredGrades.Select(g => g.name)));
+            Debug.LogError($"❌ Fallback не смог довести до 2 наблюдений {underObservedGrades.Count} марок: " +
+                          string.Join(", ", underObservedGrades.Select(g => g.name)));
         }
 
         return solution;
