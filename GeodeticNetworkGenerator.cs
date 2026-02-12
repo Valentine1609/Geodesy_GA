@@ -5,15 +5,10 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
-using System.Xml;
 using TMPro;
-using Unity.VisualScripting;
 using UnityEditor;
 using UnityEngine;
-using UnityEngine.UI;
 using Debug = UnityEngine.Debug;
-using System.Text.RegularExpressions;
-using MathNet;
 
 
 
@@ -184,56 +179,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         DebugStationCoverage(bestSolution);
     }
 
-    private bool IsResectionClosed(List<Station> solution, Bounds bounds, Collider buildingCollider)
-    {
-        if (solution == null || solution.Count < minStations) return false;
-
-        // 1. Быстрая проверка: все станции должны видеть хотя бы одну марку
-        foreach (var s in solution)
-        {
-            if (s.visibleGrades == null || s.visibleGrades.Count == 0)
-                return false;
-
-            if (IsInsideAnyBuilding(s.position))
-                return false;
-        }
-
-        // 2. Упрощённая проверка покрытия: хотя бы 80% марок должны быть видны
-        var covered = new HashSet<Transform>();
-        foreach (var s in solution)
-        {
-            foreach (var grade in s.visibleGrades)
-            {
-                covered.Add(grade);
-            }
-        }
-
-        // УСПОКОИЛИ условие: достаточно 80% покрытия
-        float coverageRatio = (float)covered.Count / grades.Count;
-        return coverageRatio >= 0.8f; // Было: coverageRatio == 1.0f
-    }
     private Dictionary<Vector3Int, HashSet<Transform>> visibilityCache = new Dictionary<Vector3Int, HashSet<Transform>>();
-    private void ClearCache()
-    {
-        if (visibilityCache != null)
-            visibilityCache.Clear();
-    }
-    private HashSet<Transform> GetCachedVisibleGrades(Vector3 pos)
-    {
-        // Округляем позицию для ключа кэша
-        Vector3Int key = new Vector3Int(
-            Mathf.RoundToInt(pos.x),
-            Mathf.RoundToInt(pos.y),
-            Mathf.RoundToInt(pos.z)
-        );
 
-        if (visibilityCache.TryGetValue(key, out var cached))
-            return cached;
-
-        var visible = GetVisibleGradesFromPos(pos);
-        visibilityCache[key] = visible;
-        return visible;
-    }
 
     // ДОБАВЬТЕ эти методы для генетического алгоритма:
 
@@ -1894,65 +1841,6 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         return true;
     }
 
-    // Проверка нахождения внутри здания
-    private bool IsInsideBuildingPhysics(Vector3 pos, Collider buildingCollider)
-    {
-        if (buildingCollider == null) return false;
-
-        // 1. Проверка через bounds - быстрая предварительная проверка
-        if (!buildingCollider.bounds.Contains(pos))
-            return false;
-
-        // 2. Проверка через OverlapSphere с увеличенным радиусом
-        float checkRadius = 1.0f; // Увеличиваем радиус проверки
-        Collider[] hits = Physics.OverlapSphere(pos, checkRadius);
-        foreach (var hit in hits)
-        {
-            if (hit == buildingCollider || hit.CompareTag("building"))
-            {
-                Debug.Log($"Обнаружено здание в радиусе {checkRadius}m от точки {pos}");
-                return true;
-            }
-        }
-
-        // 3. Проверка через ClosestPoint
-        Vector3 closestPoint = buildingCollider.ClosestPoint(pos);
-        float distanceToClosest = Vector3.Distance(pos, closestPoint);
-        if (distanceToClosest < 0.1f) // Увеличиваем порог
-        {
-            Debug.Log($"Точка слишком близко к зданию! Расстояние: {distanceToClosest:F3}m");
-            return true;
-        }
-
-        // 4. Дополнительная проверка: Raycast в нескольких направлениях
-        int buildingHits = 0;
-        Vector3[] rayDirections = {
-        Vector3.forward, Vector3.back, Vector3.left, Vector3.right,
-        new Vector3(1, 0, 1).normalized, new Vector3(-1, 0, 1).normalized,
-        new Vector3(1, 0, -1).normalized, new Vector3(-1, 0, -1).normalized
-    };
-
-        foreach (Vector3 dir in rayDirections)
-        {
-            if (Physics.Raycast(pos, dir, out RaycastHit hit, 5f))
-            {
-                if (hit.collider == buildingCollider || hit.collider.CompareTag("building"))
-                {
-                    buildingHits++;
-                }
-            }
-        }
-
-        // Если с большинства направлений попадаем в здание - вероятно внутри
-        if (buildingHits >= 6)
-        {
-            Debug.Log($"Точка внутри здания (попадания с {buildingHits} направлений)");
-            return true;
-        }
-
-        return false;
-    }
-
     // ДОПОЛНИТЕЛЬНЫЙ метод: проверка через физику с учетом всех объектов с тегом building
     // Замените метод IsInsideAnyBuilding на этот:
     private bool IsInsideAnyBuilding(Vector3 pos)
@@ -2036,44 +1924,6 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         return true;
     }
 
-    // Дополнительные вспомогательные методы для проверки принадлежности к зданию
-    private bool IsChildOfBuilding(Transform obj)
-    {
-        Transform current = obj;
-        while (current.parent != null)
-        {
-            if (current.parent.CompareTag("building"))
-                return true;
-            current = current.parent;
-        }
-        return false;
-    }
-
-    private bool IsPartOfBuildingStructure(Transform obj)
-    {
-        // Проверяем по имени (часто части зданий имеют специфичные имена)
-        string lowerName = obj.name.ToLower();
-        if (lowerName.Contains("wall") || lowerName.Contains("roof") ||
-            lowerName.Contains("floor") || lowerName.Contains("column") ||
-            lowerName.Contains("beam") || lowerName.Contains("window") ||
-            lowerName.Contains("door") || lowerName.Contains("facade"))
-        {
-            return true;
-        }
-
-        // Проверяем родителя
-        if (obj.parent != null)
-        {
-            string parentLowerName = obj.parent.name.ToLower();
-            if (parentLowerName.Contains("building") || parentLowerName.Contains("house") ||
-                parentLowerName.Contains("structure"))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
 
     // Получение видимых марок с позиции
     private HashSet<Transform> GetVisibleGradesFromPos(Vector3 pos)
@@ -2430,64 +2280,6 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         public string stderr;
         public string report;
     }
-    private void ShowGradeShiftSuggestions(double[,] covariance, double targetSigma = 0.003)
-    {
-        if (covariance == null) return;
-
-        int M = grades.Count;
-
-        Debug.Log("=== РЕКОМЕНДАЦИИ ПО УЛУЧШЕНИЮ ГЕОМЕТРИИ МАРОК ===");
-
-        for (int gi = 0; gi < M; gi++)
-        {
-            int b = gi * 3;
-            if (b + 2 >= covariance.GetLength(0)) continue;
-
-            // Ковариация марки (3×3)
-            double[,] C = new double[3, 3];
-            for (int i = 0; i < 3; i++)
-                for (int j = 0; j < 3; j++)
-                    C[i, j] = covariance[b + i, b + j];
-
-            // Собственные значения и векторы
-            if (!JacobiEigenDecomposition(C, out double[] eig, out double[,] vec))
-                continue;
-
-            // Наибольшее собственное значение → худшее направление
-            int kMax = 0;
-            for (int k = 1; k < 3; k++)
-                if (eig[k] > eig[kMax]) kMax = k;
-
-            double sigmaWorst = Math.Sqrt(eig[kMax]);
-            if (sigmaWorst <= targetSigma)
-                continue; // марка уже хорошая
-
-            // Направление ухудшения
-            Vector3 dir = new Vector3(
-                (float)vec[0, kMax],
-                (float)vec[1, kMax],
-                (float)vec[2, kMax]
-            ).normalized;
-
-            // Сколько нужно уменьшить дисперсию
-            double factor = (sigmaWorst - targetSigma) / sigmaWorst;
-            double shiftMeters = Math.Clamp(factor * 0.3, 0.05, 0.5); // 5–50 см
-
-            // Интерпретация направления
-            string directionText =
-                Math.Abs(dir.x) > Math.Abs(dir.z)
-                    ? (dir.x > 0 ? "вправо" : "влево")
-                    : (dir.z > 0 ? "вперёд" : "назад");
-
-            Debug.Log(
-                $"Марка {grades[gi].name}: " +
-                $"σ={sigmaWorst * 1000:F1} мм → " +
-                $"рекомендуется сместить {directionText} " +
-                $"примерно на {shiftMeters * 100:F0} см"
-            );
-        }
-    }
-
 
     // ==========================================================================
     //                           NETWORK REPORT
@@ -3551,36 +3343,135 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     {
         if (selectedStations == null || selectedStations.Count == 0)
         {
-            Debug.LogWarning("Нет станций для экспорта в TXT");
+            Debug.LogWarning("Нет станций для экспорта");
             return;
         }
 
-        string txtPath = Path.Combine(Application.streamingAssetsPath, "station_route.txt");
+        string buildingName = buildingDropdown.options[buildingDropdown.value].text;
+        GameObject building = GameObject.Find(buildingName);
+
+        if (building == null)
+        {
+            Debug.LogError($"Здание '{buildingName}' не найдено");
+            return;
+        }
+
+        var meshColliders = building
+            .GetComponentsInChildren<MeshCollider>(true)
+            .Where(c => c.sharedMesh != null)
+            .ToList();
+
+        if (meshColliders.Count == 0)
+        {
+            Debug.LogError("В здании отсутствуют MeshCollider");
+            return;
+        }
+
+        string path = Path.Combine(Application.streamingAssetsPath, "station_route.txt");
         Directory.CreateDirectory(Application.streamingAssetsPath);
 
         try
         {
-            using (var writer = new StreamWriter(txtPath, false, Encoding.UTF8))
+            using (var writer = new StreamWriter(path, false, Encoding.UTF8))
             {
-                // Заголовок: ;X;Y;Z
-                writer.WriteLine(";X;Y;Z");
+                // ===== ЗДАНИЕ =====
+                writer.WriteLine($"BUILDING;{building.name}");
+                writer.WriteLine();
 
+                // ===== ФАСАДЫ =====
+                writer.WriteLine("FACADES;COLLIDER;NX;NY;NZ;PX;PY;PZ");
+
+                foreach (var collider in meshColliders)
+                    ExtractAndExportFacades(collider, writer);
+
+                writer.WriteLine();
+
+                // ===== МАРКИ =====
+                writer.WriteLine("GRADES;X;Y;Z");
+                foreach (Transform t in building.GetComponentsInChildren<Transform>(true))
+                {
+                    if (!t.CompareTag("grade")) continue;
+
+                    Vector3 p = t.position;
+                    writer.WriteLine($"{t.name};{p.x:F3};{p.y:F3};{p.z:F3}");
+                }
+
+                writer.WriteLine();
+
+                // ===== СТАНЦИИ =====
+                writer.WriteLine("STATIONS;X;Y;Z");
                 for (int i = 0; i < selectedStations.Count; i++)
                 {
                     Vector3 pos = selectedStations[i].position;
-                    string name = $"Station{i + 1}";
-                    writer.WriteLine($"{name};{pos.x:F3};{pos.y:F3};{pos.z:F3}");
+                    writer.WriteLine($"Station{i + 1};{pos.x:F3};{pos.y:F3};{pos.z:F3}");
                 }
             }
 
-            Debug.Log($"✅ Координаты станций экспортированы в: {txtPath}");
+            Debug.Log($"Экспорт завершён: {path}");
         }
         catch (Exception ex)
         {
-            Debug.LogError($"❌ Ошибка при записи TXT: {ex.Message}");
+            Debug.LogError($"Ошибка экспорта: {ex.Message}");
         }
     }
+    private void ExtractAndExportFacades(MeshCollider collider, StreamWriter writer)
+    {
+        Mesh mesh = collider.sharedMesh;
+        Vector3[] v = mesh.vertices;
+        int[] t = mesh.triangles;
+        Transform tr = collider.transform;
 
+        Dictionary<Vector3, List<Vector3>> clusters = new();
+
+        for (int i = 0; i < t.Length; i += 3)
+        {
+            Vector3 p0 = tr.TransformPoint(v[t[i]]);
+            Vector3 p1 = tr.TransformPoint(v[t[i + 1]]);
+            Vector3 p2 = tr.TransformPoint(v[t[i + 2]]);
+
+            Vector3 normal = Vector3.Cross(p1 - p0, p2 - p0);
+            float area = normal.magnitude * 0.5f;
+
+            if (area < 0.05f) continue; // фильтр шума
+
+            normal.Normalize();
+
+            // игнор крыши и пола
+            if (Mathf.Abs(normal.y) > 0.3f) continue;
+
+            Vector3 qNormal = QuantizeNormal(normal, 0.1f);
+
+            if (!clusters.ContainsKey(qNormal))
+                clusters[qNormal] = new List<Vector3>();
+
+            clusters[qNormal].Add((p0 + p1 + p2) / 3f);
+        }
+
+        int id = 1;
+        foreach (var kv in clusters)
+        {
+            Vector3 center =
+                kv.Value.Aggregate(Vector3.zero, (a, b) => a + b) / kv.Value.Count;
+
+            Vector3 n = kv.Key;
+
+            writer.WriteLine(
+                $"FACADE;{collider.name}_F{id};" +
+                $"{n.x:F4};{n.y:F4};{n.z:F4};" +
+                $"{center.x:F3};{center.y:F3};{center.z:F3}"
+            );
+
+            id++;
+        }
+    }
+    private Vector3 QuantizeNormal(Vector3 n, float step)
+    {
+        return new Vector3(
+            Mathf.Round(n.x / step) * step,
+            0f,
+            Mathf.Round(n.z / step) * step
+        ).normalized;
+    }
     public void ClearStations()
     {
         // удаляет ссылку на выбранные станции; фактические префабы остаются в parentContainer
