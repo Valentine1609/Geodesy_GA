@@ -17,7 +17,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     [Header("Настройки")]
     public GameObject networkPrefab;
     public TMP_Dropdown buildingDropdown;
-    public float offset = 5f;
+    public float offset = 50f;
     public Transform parentContainer;
     [Header("Raycast")]
     public float raycastHeight = 5f;
@@ -138,7 +138,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         RunPython(); // 
         PrintNetworkReport();
         ExportStationsToCSV();
-
+        //PerformAdjustmentUsingExistingMatrix();
+        //ComputeAndPrintAdjustedObservations();
     }
 
     private void GenerateNetwork()
@@ -1250,8 +1251,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     {
         // УМЕНЬШАЕМ расстояния для более близкого размещения
         float buildingSize = bounds.size.magnitude;
-        float minDistance = Mathf.Max(buildingSize * 0.1f, 6f); 
-        float maxDistance = Mathf.Max(buildingSize * 0.3f, 12f); 
+        float minDistance = Mathf.Max(buildingSize * 0.1f, 6f);
+        float maxDistance = Mathf.Max(buildingSize * 0.3f, 12f);
 
         Debug.Log($"Размер здания: {buildingSize:F1}m, оптимальное расстояние: {minDistance:F1}-{maxDistance:F1}m");
         return (minDistance + maxDistance) / 2f;
@@ -1630,7 +1631,6 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
         return child;
     }
-
 
     // Мутация
     private List<Station> Mutate(List<Station> solution, float mutationRate, Bounds bounds, Collider buildingCollider, float baseOffset)
@@ -2093,6 +2093,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
     private void ExportXML()
     {
+        UnityEngine.Random.InitState(12345);
         if (selectedStations.Count == 0 || grades.Count == 0)
         {
             Debug.LogWarning("Нет данных для экспорта XML");
@@ -2116,12 +2117,9 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         {
             Vector3 relativePos = selectedStations[i].position - origin;
 
-            // Добавление случайного шума (в метрах)
-            float noiseX = UnityEngine.Random.Range(-coordNoise, coordNoise) / 1000f;
-            float noiseZ = UnityEngine.Random.Range(-coordNoise, coordNoise) / 1000f;
-
-            float noisyX = relativePos.x + noiseX;
-            float noisyZ = relativePos.z + noiseZ;
+            // Убираем шум – используем точные координаты
+            float noisyX = relativePos.x;
+            float noisyZ = relativePos.z;
 
             if (i == 0)
             {
@@ -2208,7 +2206,10 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                     string dirDms = ConvertDegreesToDMS(dirDeg);
 
                     // Расстояние между станцией и целью
-                    float dist = Vector3.Distance(fromPos, toPos);
+                    float dx = toPos.x - fromPos.x;
+                    float dz = toPos.z - fromPos.z;
+                    float dist = Mathf.Sqrt(dx * dx + dz * dz);
+
 
                     // === Используем пользовательские stdev ===
                     xml.AppendLine(
@@ -2846,7 +2847,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             }
         }
 
-        return N; // ← ЧИСТАЯ ГЕОМЕТРИЯ СЕТИ, без искажений!
+        return N;
     }
 
     // ==========================================================================
@@ -2948,6 +2949,573 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 N[i, j] += weight * ri * rj;
             }
         }
+    }
+
+    private Dictionary<(int, int), double> observedDistances = new();
+    private Dictionary<(int, int, int), double> observedAngles = new();
+
+private void InitializeObservations()
+{
+    // Жёсткая фиксация случайности (как в GNU Gama)
+    UnityEngine.Random.InitState(12345);
+
+    observedDistances.Clear();
+    observedAngles.Clear();
+
+    for (int si = 0; si < selectedStations.Count; si++)
+    {
+        var st = selectedStations[si];
+        if (st?.ms60 == null) continue;
+
+        Vector3 S = st.ms60.position;
+
+        // === 1. Сбор видимых марок ===
+        var visible = new List<(int idx, Vector3 pos)>();
+
+        for (int gi = 0; gi < grades.Count; gi++)
+        {
+            if (grades[gi] == null) continue;
+            if (!CheckLineOfSightToGrade(st.ms60, grades[gi])) continue;
+
+            visible.Add((gi, grades[gi].position));
+        }
+
+        if (visible.Count == 0) continue;
+
+        // =====================================================
+        // === 2. РАССТОЯНИЯ (ТОЛЬКО 2D!)
+        // =====================================================
+        foreach (var v in visible)
+        {
+            Vector3 d = v.pos - S;
+
+            double dx = d.x;
+            double dz = d.z;
+
+            double r = Math.Sqrt(dx * dx + dz * dz);
+            if (r < 1e-6) continue;
+
+             observedDistances[(si, v.idx)] = r;
+            }
+
+        // =====================================================
+        // === 3. УГЛЫ (строго через направления!)
+        // =====================================================
+        for (int i = 0; i < visible.Count - 1; i++)
+        {
+            for (int j = i + 1; j < visible.Count; j++)
+            {
+                Vector3 p1 = visible[i].pos - S;
+                Vector3 p2 = visible[j].pos - S;
+
+                // направления
+                double α1 = Math.Atan2(p1.x, p1.z);
+                double α2 = Math.Atan2(p2.x, p2.z);
+
+                if (α1 < 0) α1 += 2 * Math.PI;
+                if (α2 < 0) α2 += 2 * Math.PI;
+
+                double angle = α2 - α1;
+
+                if (angle < 0) angle += 2 * Math.PI;
+
+                    // шум угла (в радианах!)
+                  observedAngles[(si, visible[i].idx, visible[j].idx)] = angle;
+                }
+        }
+    }
+
+    Debug.Log($"Наблюдения зафиксированы: dist={observedDistances.Count}, angles={observedAngles.Count}");
+}
+
+    // ==========================================================================
+    //   ADJUSTMENT USING EXISTING ComputeNormalMatrix LOGIC (GNU Gama style)
+    //   ДАННЫЕ: selectedStations/grades (как в ExportXML)
+    //   ВЫВОД: координаты марок как в GNU: X=East, Y=North
+    // ==========================================================================
+
+    public void PerformAdjustmentUsingExistingMatrix(int maxIter = 1)
+    {
+        if (selectedStations.Count == 0 || grades.Count == 0)
+        {
+            Debug.LogError("Нет данных для уравнивания!");
+            return;
+        }
+
+        UnityEngine.Random.InitState(12345); // фиксируем случайность
+        InitializeObservations();            // создаём наблюдения ОДИН РАЗ
+
+        Debug.Log("\n=== УРАВНИВАНИЕ СЕТИ (МНК, с итерациями) ===");
+
+        int nStations = selectedStations.Count;
+        int nGrades = grades.Count;
+
+        // Сохраняем текущие координаты марок (будем их обновлять)
+        Vector3[] gradePos = new Vector3[nGrades];
+        for (int gi = 0; gi < nGrades; gi++)
+            gradePos[gi] = grades[gi].position;
+
+        for (int iter = 0; iter < maxIter; iter++)
+        {
+            // Обновляем позиции марок в сцене для вычисления невязок
+            for (int gi = 0; gi < nGrades; gi++)
+                grades[gi].position = gradePos[gi];
+
+            var result = ComputeNormalMatrixWithMisclosures(out bool isDegenerate);
+            if (result.N == null || isDegenerate)
+            {
+                Debug.LogError("Не удалось построить нормальную матрицу или сеть вырождена!");
+                return;
+            }
+
+            double[,] N = result.N;
+            double[] u = result.u;
+            int gradeStartIdx = 3 * nStations;
+            int nGradeParams = 3 * nGrades;
+
+            // Извлекаем подматрицу для марок
+            double[,] N_gg = new double[nGradeParams, nGradeParams];
+            double[] u_g = new double[nGradeParams];
+            for (int i = 0; i < nGradeParams; i++)
+            {
+                u_g[i] = u[gradeStartIdx + i];
+                for (int j = 0; j < nGradeParams; j++)
+                    N_gg[i, j] = N[gradeStartIdx + i, gradeStartIdx + j];
+            }
+
+            if (!SolveWithSVD(N_gg, u_g, out double[] dx_g))
+            {
+                Debug.LogError("Не удалось решить систему для марок!");
+                return;
+            }
+            if (dx_g == null)
+            {
+                Debug.LogError("Не удалось решить систему для марок!");
+                return;
+            }
+
+            double maxChange = 0;
+            for (int gi = 0; gi < nGrades; gi++)
+            {
+                Vector3 change = new Vector3(
+                    (float)dx_g[gi * 3 + 0],
+                    (float)dx_g[gi * 3 + 1],
+                    (float)dx_g[gi * 3 + 2]
+                );
+                gradePos[gi] += change;
+                maxChange = Math.Max(maxChange, change.magnitude);
+            }
+
+            Debug.Log($"Итерация {iter + 1}: max |dx| = {maxChange * 1000:F4} мм");
+            if (maxChange < 1e-6) break;
+        }
+
+        // Вывод результатов
+        Vector3 origin = selectedStations[0].position;
+        Debug.Log("\n=== РЕЗУЛЬТАТЫ: КООРДИНАТЫ МАРОК (сравнение с GNU Gama) ===");
+        Debug.Log(new string('-', 55));
+        Debug.Log($"{"Марка",-6} {"X (East), м",14} {"Y (North), м",14}");
+        Debug.Log(new string('-', 55));
+        for (int gi = 0; gi < nGrades; gi++)
+        {
+            Vector3 rel = gradePos[gi] - origin;
+            Debug.Log($"G{gi + 1,-6} {rel.x,14:F5} {rel.z,14:F5}");
+        }
+        Debug.Log(new string('-', 55));
+    }
+
+    public void ComputeAndPrintAdjustedObservations()
+    {
+        Debug.Log("\n=== УРАВНЕННЫЕ НАБЛЮДЕНИЯ (L_adj = L_obs + v) ===");
+
+        // ===== 1. ПОЛУЧАЕМ РЕЗУЛЬТАТЫ УРАВНИВАНИЯ =====
+        var result = ComputeNormalMatrixWithMisclosures(out bool isDegenerate);
+        if (result.N == null || isDegenerate) return;
+
+        int nStations = selectedStations.Count;
+        int nGrades = grades.Count;
+        int gradeStartIdx = 3 * nStations;
+        int nGradeParams = 3 * nGrades;
+
+        // Извлекаем подматрицу для марок
+        double[,] N_gg = new double[nGradeParams, nGradeParams];
+        double[] u_g = new double[nGradeParams];
+        for (int i = 0; i < nGradeParams; i++)
+        {
+            u_g[i] = result.u[gradeStartIdx + i];
+            for (int j = 0; j < nGradeParams; j++)
+                N_gg[i, j] = result.N[gradeStartIdx + i, gradeStartIdx + j];
+        }
+
+        // Решаем систему
+        if (!SolveWithSVD(N_gg, u_g, out double[] dx_g)) return;
+        if (dx_g == null) return;
+
+        // ===== 2. ВЫЧИСЛЯЕМ УРАВНЕННЫЕ КООРДИНАТЫ МАРОК =====
+        Vector3 origin = selectedStations[0].position;
+        var adjustedMarks = new Dictionary<string, Vector3>();
+
+        for (int gi = 0; gi < nGrades; gi++)
+        {
+            Vector3 origPos = grades[gi].position - origin;
+            Vector3 adjPos = new Vector3(
+                (float)(origPos.x + dx_g[gi * 3 + 0]),  // X = East
+                (float)(origPos.y + dx_g[gi * 3 + 1]),  // Y = Height
+                (float)(origPos.z + dx_g[gi * 3 + 2])   // Z = North
+            );
+            adjustedMarks[$"G{gi + 1}"] = adjPos;
+        }
+
+        // ===== 3. ВЫЧИСЛЯЕМ УРАВНЕННЫЕ НАБЛЮДЕНИЯ =====
+        Debug.Log(new string('-', 90));
+        Debug.Log($"{"Станция",-6} {"Цель",-6} {"Тип",-10} {"L_obs",12} {"v",10} {"L_adj",12} {"Статус"}");
+        Debug.Log(new string('-', 90));
+
+        double sumVTPV = 0;  // для вычисления σ₀
+        int nObs = 0;
+
+        foreach (var st in selectedStations)
+        {
+            string fromId = $"T{selectedStations.IndexOf(st) + 1}";
+            Vector3 S = st.ms60 != null ? st.ms60.position : st.position;
+
+            foreach (var grade in grades)
+            {
+                string toId = $"G{grades.IndexOf(grade) + 1}";
+                if (!adjustedMarks.ContainsKey(toId)) continue;
+
+                Vector3 G_adj = adjustedMarks[toId];
+
+                // --- РАССТОЯНИЕ ---
+                double dx = grade.position.x - S.x;
+                double dz = grade.position.z - S.z;
+                double dist_obs = Math.Sqrt(dx * dx + dz * dz);
+                double dist_comp = Vector3.Distance(S, G_adj);
+                double v_dist = dist_obs - dist_comp;  // поправка
+                double dist_adj = dist_obs + v_dist;    // уравненное
+
+                string distStatus = Math.Abs(v_dist) * 1000 < 1.0 ? "✓" :
+                                   Math.Abs(v_dist) * 1000 < 5.0 ? "~" : "✗";
+
+                Debug.Log(
+                    $"{fromId,-6} {toId,-6} {"Dist",-10} " +
+                    $"{dist_obs,12:F3} {v_dist,10:F3} {dist_adj,12:F3} {distStatus}");
+
+                sumVTPV += v_dist * v_dist / Math.Pow(DistanceStdevMm / 1000.0, 2);
+                nObs++;
+
+                // --- НАПРАВЛЕНИЕ (азимут) ---
+                double az_obs = CalculateAzimuthDegrees(S, grade.position) * Math.PI / 180.0;
+                double az_comp = Math.Atan2(G_adj.x - (S.x - origin.x), G_adj.z - (S.z - origin.z));
+                if (az_comp < 0) az_comp += 2 * Math.PI;
+
+                double v_az = az_obs - az_comp;
+                while (v_az > Math.PI) v_az -= 2 * Math.PI;
+                while (v_az < -Math.PI) v_az += 2 * Math.PI;
+
+                double az_adj = az_obs + v_az;
+                if (az_adj < 0) az_adj += 2 * Math.PI;
+                if (az_adj >= 2 * Math.PI) az_adj -= 2 * Math.PI;
+
+                // Конвертируем в градусы для вывода
+                double az_obs_deg = az_obs * 180 / Math.PI;
+                double v_az_cc = v_az * 180 * 3600 / Math.PI;  // в санти-секундах
+                double az_adj_deg = az_adj * 180 / Math.PI;
+
+                string azStatus = Math.Abs(v_az_cc) < 10 ? "✓" :
+                                 Math.Abs(v_az_cc) < 30 ? "~" : "✗";
+
+                Debug.Log(
+                    $"{fromId,-6} {toId,-6} {"Azimuth",-10} " +
+                    $"{az_obs_deg,12:F2}° {v_az_cc,10:F1}cc {az_adj_deg,12:F2}° {azStatus}");
+
+                double sigmaAng_rad = (DirectionStdevCc / 100.0) * Math.PI / (180.0 * 3600.0);
+                sumVTPV += v_az * v_az / (sigmaAng_rad * sigmaAng_rad);
+                nObs++;
+            }
+        }
+
+        Debug.Log(new string('-', 90));
+
+        // ===== 4. АПОСТЕРИОРНАЯ ОЦЕНКА ТОЧНОСТИ =====
+        int nParams = nGradeParams;  // только координаты марок
+        double dof = nObs - nParams; // число степеней свободы
+
+        if (dof > 0)
+        {
+            double sigma0_aposteriori = Math.Sqrt(sumVTPV / dof);
+            Debug.Log($"Апостериорная СКО единицы веса: σ₀ = {sigma0_aposteriori:F3}");
+            Debug.Log($"Число наблюдений: {nObs}, параметров: {nParams}, степеней свободы: {dof}");
+
+            if (sigma0_aposteriori < 0.8)
+                Debug.Log("✓ Точность наблюдений лучше априорной");
+            else if (sigma0_aposteriori < 1.2)
+                Debug.Log("✓ Точность соответствует априорной");
+            else
+                Debug.LogWarning($"⚠ Точность хуже априорной (σ₀={sigma0_aposteriori:F2})");
+        }
+
+        Debug.Log("=== УРАВНЕННЫЕ НАБЛЮДЕНИЯ ЗАВЕРШЕНЫ ===\n");
+    } 
+
+    private struct NormalMatrixResult
+    {
+        public double[,] N;  // Нормальная матрица
+        public double[] u;   // Вектор невязок: Aᵀ * P * l
+
+        public NormalMatrixResult(double[,] n, double[] misc)
+        {
+            N = n; u = misc;
+        }
+    }
+
+    private NormalMatrixResult ComputeNormalMatrixWithMisclosures(out bool isDegenerate)
+    {
+        isDegenerate = false;
+
+        int nGrades = grades?.Count ?? 0;
+        int nStations = selectedStations?.Count ?? 0;
+        if (nGrades < 1 || nStations < 1)
+        {
+            isDegenerate = true;
+            return new NormalMatrixResult(null, null);
+        }
+
+        int n = 3 * (nStations + nGrades);
+        double[,] N = new double[n, n];
+        double[] u = new double[n];
+
+        double sigmaDist = Math.Max(1e-6, DistanceStdevMm / 1000.0);
+        double wDist = 1.0 / (sigmaDist * sigmaDist);
+        double sigmaAng_rad = (DirectionStdevCc / 100.0) * (Math.PI / (180.0 * 3600.0));
+        double wAng = 1.0 / (sigmaAng_rad * sigmaAng_rad);
+
+        for (int si = 0; si < nStations; si++)
+        {
+            var st = selectedStations[si];
+            if (st?.ms60?.position == null) continue;
+            Vector3 S = st.ms60.position;
+
+            var visible = new List<(int idx, Vector3 p)>();
+            for (int gi = 0; gi < nGrades; gi++)
+            {
+                if (grades[gi] == null) continue;
+                if (CheckLineOfSightToGrade(st.ms60, grades[gi]))
+                    visible.Add((gi, grades[gi].position));
+            }
+            if (visible.Count < 1) continue;
+
+            // === РАССТОЯНИЯ (горизонтальные) ===
+            foreach (var v in visible)
+            {
+                Vector3 d = v.p - S;
+                double dx = d.x, dz = d.z;
+                double r_computed = Math.Sqrt(dx * dx + dz * dz);
+                if (r_computed < 1e-6) continue;
+
+                if (!observedDistances.TryGetValue((si, v.idx), out double r_observed))
+                    continue;
+
+                double misclosure = r_observed - r_computed;
+
+                int siIdx = si * 3;
+                int giIdx = (nStations + v.idx) * 3;
+
+                double[] row = new double[n];
+                row[siIdx + 0] = -dx / r_computed;
+                row[siIdx + 2] = -dz / r_computed;
+                row[giIdx + 0] = dx / r_computed;
+                row[giIdx + 2] = dz / r_computed;
+                // Производные по Y обнулены
+
+                AccumulateRowToNAndU(N, u, row, misclosure, wDist);
+            }
+
+            // === ГОРИЗОНТАЛЬНЫЕ УГЛЫ (без изменений) ===
+            for (int i = 0; i < visible.Count - 1; i++)
+            {
+                for (int j = i + 1; j < visible.Count; j++)
+                {
+                    Vector3 p1 = visible[i].p - S;
+                    Vector3 p2 = visible[j].p - S;
+                    double h1_sq = p1.x * p1.x + p1.z * p1.z;
+                    double h2_sq = p2.x * p2.x + p2.z * p2.z;
+                    if (h1_sq > 1e-12 && h2_sq > 1e-12)
+                    {
+                        double α1_comp = Math.Atan2(p1.x, p1.z);
+                        double α2_comp = Math.Atan2(p2.x, p2.z);
+                        if (α1_comp < 0) α1_comp += 2 * Math.PI;
+                        if (α2_comp < 0) α2_comp += 2 * Math.PI;
+                        double α1_obs = CalculateAzimuthDegrees(S, visible[i].p) * Math.PI / 180.0;
+                        double α2_obs = CalculateAzimuthDegrees(S, visible[j].p) * Math.PI / 180.0;
+                        if (!observedAngles.TryGetValue((si, visible[i].idx, visible[j].idx), out double obs))
+                            continue;
+
+                        double comp = α2_comp - α1_comp;
+                        double misclosure = obs - comp;
+                        while (misclosure > Math.PI) misclosure -= 2 * Math.PI;
+                        while (misclosure < -Math.PI) misclosure += 2 * Math.PI;
+
+                        int siIdx = si * 3;
+                        int gi1Idx = (nStations + visible[i].idx) * 3;
+                        int gi2Idx = (nStations + visible[j].idx) * 3;
+
+                        double[] rowHor = new double[n];
+                        rowHor[gi1Idx + 0] = p1.z / h1_sq;
+                        rowHor[gi1Idx + 2] = -p1.x / h1_sq;
+                        rowHor[gi2Idx + 0] = -p2.z / h2_sq;
+                        rowHor[gi2Idx + 2] = p2.x / h2_sq;
+                        rowHor[siIdx + 0] = -rowHor[gi1Idx + 0] - rowHor[gi2Idx + 0];
+                        rowHor[siIdx + 2] = -rowHor[gi1Idx + 2] - rowHor[gi2Idx + 2];
+
+                        AccumulateRowToNAndU(N, u, rowHor, misclosure, wAng);
+                    }
+                }
+            }
+
+            // === ВЕРТИКАЛЬНЫЕ УГЛЫ – УДАЛЕНЫ ===
+        }
+
+        // ===== ФИКСАЦИЯ ДАТУМА (без изменений) =====
+        if (nStations >= 1)
+        {
+            for (int k = 0; k < 3; k++)
+            {
+                N[k, k] += 1e15;   // было 1e12
+                u[k] += 0;
+            }
+        }
+
+        // Фиксация ВСЕХ Y (вся сеть 2D)
+        for (int i = 0; i < n; i += 3)
+        {
+            N[i + 1, i + 1] += 1e15;   // было 1e12
+            u[i + 1] += 0;
+        }
+
+        if (nStations >= 2)
+        {
+            N[5, 5] += 1e15; N[4, 4] += 1e15;   // было 1e12
+            u[5] += 1e15 * 0; u[4] += 1e15 * 0;
+
+            Vector3 s1 = selectedStations[0].ms60.position;
+            Vector3 s2 = selectedStations[1].ms60.position;
+            double dx = s2.x - s1.x, dy = s2.y - s1.y, dz = s2.z - s1.z;
+            double dist_sq = dx * dx + dy * dy + dz * dz;
+            if (dist_sq > 1e-12)
+            {
+                double w_scale = 1e15 / dist_sq;   // было 1e12
+                for (int i = 0; i < 6; i++)
+                    for (int j = 0; j < 6; j++)
+                    {
+                        double val = (i < 3 ? (j < 3 ? 1 : -1) : (j < 3 ? -1 : 1)) *
+                                     new[] { dx, dy, dz, dx, dy, dz }[i] * new[] { dx, dy, dz, dx, dy, dz }[j];
+                        N[i, j] += w_scale * val;
+                    }
+            }
+        }
+        if (nStations >= 3) { N[8, 8] += 1e15; u[8] += 1e15 * 0; }
+
+        const double reg = 1e-10;
+        for (int i = 0; i < n; i++) { N[i, i] += reg; }
+
+        if (!JacobiEigenDecomposition(N, out double[] ev, out _))
+        {
+            isDegenerate = true;
+            return new NormalMatrixResult(N, u);
+        }
+        isDegenerate = (ev.Min() < reg * 0.1);
+
+        return new NormalMatrixResult(N, u);
+    }
+
+    private void AccumulateRowToNAndU(double[,] N, double[] u, double[] row, double misclosure, double weight)
+    {
+        int n = N.GetLength(0);
+
+        // N += weight * rowᵀ * row
+        for (int i = 0; i < n; i++)
+        {
+            double ri = row[i];
+            if (Math.Abs(ri) < 1e-16) continue;
+
+            // u += weight * row * misclosure
+            u[i] += weight * ri * misclosure;
+
+            for (int j = 0; j < n; j++)
+            {
+                double rj = row[j];
+                if (Math.Abs(rj) < 1e-16) continue;
+                N[i, j] += weight * ri * rj;
+            }
+        }
+    }
+
+
+    private double[] SolveGauss(double[,] A, double[] b)
+    {
+        int n = A.GetLength(0);
+        if (n == 0) return null;
+
+        double[,] M = new double[n, n + 1];
+        for (int i = 0; i < n; i++)
+        {
+            for (int j = 0; j < n; j++) M[i, j] = A[i, j];
+            M[i, n] = b[i];
+        }
+
+        for (int col = 0; col < n; col++)
+        {
+            int mx = col;
+            for (int r = col + 1; r < n; r++)
+                if (Math.Abs(M[r, col]) > Math.Abs(M[mx, col])) mx = r;
+
+            if (Math.Abs(M[mx, col]) < 1e-15) return null;
+            if (mx != col)
+                for (int j = col; j <= n; j++)
+                {
+                    var t = M[col, j]; M[col, j] = M[mx, j]; M[mx, j] = t;
+                }
+
+            for (int r = col + 1; r < n; r++)
+            {
+                double f = M[r, col] / M[col, col];
+                for (int j = col; j <= n; j++) M[r, j] -= f * M[col, j];
+            }
+        }
+
+        double[] x = new double[n];
+        for (int i = n - 1; i >= 0; i--)
+        {
+            double s = M[i, n];
+            for (int j = i + 1; j < n; j++) s -= M[i, j] * x[j];
+            x[i] = s / M[i, i];
+        }
+        return x;
+    }
+    private bool SolveWithSVD(double[,] A, double[] b, out double[] x, double tol = 1e-12)
+    {
+        x = null;
+        int n = A.GetLength(0);
+        if (!JacobiEigenDecomposition(A, out double[] eig, out double[,] V))
+            return false;
+
+        double maxEig = eig.Max();
+        double threshold = tol * maxEig;
+
+        x = new double[n];
+        for (int k = 0; k < n; k++)
+        {
+            if (eig[k] < threshold) continue;
+            double inv = 1.0 / eig[k];
+            double dot = 0;
+            for (int i = 0; i < n; i++)
+                dot += V[i, k] * b[i];
+            double coeff = dot * inv;
+            for (int i = 0; i < n; i++)
+                x[i] += coeff * V[i, k];
+        }
+        return true;
     }
     // Возвращает список рекомендованных позиций для добавления станции с оценкой cond (меньше лучше)
     private List<(Vector3 pos, double cond)> SuggestStationPositions(int topK = 5)
