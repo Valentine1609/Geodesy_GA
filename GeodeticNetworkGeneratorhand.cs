@@ -203,48 +203,30 @@ public class GeodeticNetworkGeneratorhand : MonoBehaviour
 
     private bool HasLineOfSight(Transform from, Transform to)
     {
-        Vector3 start = from.position + Vector3.up * raycastHeight;
-        Vector3 end = to.position + Vector3.up * raycastHeight;
+        const float instrumentHeight = 1.7f;
 
-        Vector3 dir = end - start;
-        float dist = dir.magnitude;
-        if (dist < 0.01f) return true;
+        Vector3 start = from.position + Vector3.up * instrumentHeight;
+        Vector3 end = to.position + Vector3.up * instrumentHeight; // ✅ Одинаковая высота для станций
 
-        RaycastHit[] hits = Physics.RaycastAll(
-            start,
-            dir.normalized,
-            dist,
-            Physics.DefaultRaycastLayers,
-            QueryTriggerInteraction.Collide
-        );
+        // ✅ Проверяем тег цели для правильной обработки
+        bool isStation = to.CompareTag("total_station");
+        bool isGrade = to.CompareTag("grade");
 
-        foreach (var hit in hits)
+        // Для станций используем позицию трансформера
+        if (isStation)
         {
-            Transform h = hit.transform;
-
-            // 1. Игнорируем саму цель
-            if (h == to || h.IsChildOf(to))
-                continue;
-
-            // 2. Игнорируем станцию-источник
-            if (h == from || h.IsChildOf(from))
-                continue;
-
-            // 3. Игнорируем все станции
-            if (h.CompareTag("total_station") || h.root.CompareTag("total_station"))
-                continue;
-
-            // 4. Игнорируем марки
-            if (h.CompareTag("grade") || h.root.CompareTag("grade"))
-                continue;
-
-            // 5. ВСЁ ОСТАЛЬНОЕ — ПРЕПЯТСТВИЕ
-            return false;
+            return CheckLineOfSightBetweenPoints(start, end, to);
         }
 
-        return true;
-    }
+        // Для марок пробуем найти коллайдер
+        Collider col = to.GetComponent<Collider>();
+        if (col != null)
+        {
+            end = col.bounds.center;
+        }
 
+        return CheckLineOfSightBetweenPoints(start, end, to);
+    }
     // --- Построение линии ---
     private void CreateLineBetween(Vector3 start, Vector3 end, bool visible)
     {
@@ -252,64 +234,64 @@ public class GeodeticNetworkGeneratorhand : MonoBehaviour
         lineObj.transform.SetParent(parentContainer, true);
 
         LineRenderer lr = lineObj.AddComponent<LineRenderer>();
+        lr.useWorldSpace = true; // КРИТИЧЕСКИ ВАЖНО для корректного отображения в мировых координатах
+
+        // Устанавливаем позиции напрямую (без массива)
         lr.positionCount = 2;
-        lr.SetPositions(new[] { start, end });
+        lr.SetPosition(0, start);
+        lr.SetPosition(1, end);
 
-        lr.material = new Material(Shader.Find("Sprites/Default"));
-        lr.startWidth = lr.endWidth = 0.02f;
+        // Создаём материал с резервными вариантами шейдера
+        Shader shader = Shader.Find("Universal Render Pipeline/Particles/Unlit");
+        if (shader == null) shader = Shader.Find("Particles/Unlit");
+        if (shader == null) shader = Shader.Find("Unlit/Color");
+        if (shader == null) shader = Shader.Find("Standard");
 
-        Color color = visible ? Color.green : Color.red;
+        lr.material = new Material(shader);
+        lr.startWidth = 0.03f;  // Чуть толще для надёжной видимости
+        lr.endWidth = 0.03f;
+        lr.numCapVertices = 4;  // Сглаженные концы
 
-        Gradient gradient = new Gradient();
-        gradient.SetKeys(
-            new[] { new GradientColorKey(color, 0f), new GradientColorKey(color, 1f) },
-            new[] { new GradientAlphaKey(1f, 0f), new GradientAlphaKey(1f, 1f) }
-        );
+        // ИСПРАВЛЕНО: используем простые цвета вместо градиента (градиент не работает со всеми шейдерами)
+        Color color = visible ? new Color(0f, 1f, 0f, 0.9f) : new Color(1f, 0f, 0f, 0.7f);
+        lr.startColor = color;
+        lr.endColor = color;
 
-        lr.colorGradient = gradient;
+        // Для видимости в VR
+        lr.alignment = LineAlignment.View;
     }
 
-    // Перегрузка: принимает Vector3
-    private bool CheckLineOfSightToTarget(Vector3 fromPos, Vector3 toPos)
-    {
-        // Если у вас есть поле raycastHeight — используем его, иначе 0
-        float h = 0f;
-        try { h = this.raycastHeight; } catch { h = 0f; }
-
-        Vector3 from = fromPos + Vector3.up * h;
-        Vector3 to = toPos + Vector3.up * h;
-
-        return CheckLineOfSightBetweenPoints(from, to);
-    }
-
-    // Общая реализация: проверяет все попадания между двумя точками.
-    // Любые попадания в объекты без тега "grade" или "total_station" блокируют видимость.
-    private bool CheckLineOfSightBetweenPoints(Vector3 from, Vector3 to)
+     private bool CheckLineOfSightBetweenPoints(Vector3 from, Vector3 to, Transform target)
     {
         Vector3 dir = to - from;
         float dist = dir.magnitude;
-        if (dist <= 0.0001f) return true;
+
+        if (dist < 1e-6f)
+            return true;
 
         RaycastHit[] hits = Physics.RaycastAll(from, dir.normalized, dist);
+
+        // 🔴 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ — сортировка
+        System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+
         foreach (var hit in hits)
         {
-            // Пропускаем саму цель и другие станции/марки
-            if (hit.transform.CompareTag("grade") || hit.transform.CompareTag("total_station"))
+            Transform t = hit.transform;
+
+            // ✅ Игнорируем станцию (источник и цель)
+            if (t.CompareTag("total_station"))
                 continue;
 
-            // Если попали в дочерние объекты (иногда коллайдеры на уровне child), можно также игнорировать родителя,
-            // если у родителя есть соответствующий тег:
-            var root = hit.transform.root;
-            if (root != null && (root.CompareTag("grade") || root.CompareTag("total_station")))
-                continue;
+            // ✅ Игнорируем марку-цель
+            if (t == target || t.IsChildOf(target))
+                return true;
 
-            // Любой другой объект рассматриваем как препятствие
+            // ❌ Встретили препятствие раньше цели
             return false;
         }
 
-        return true;
+        return true; // ✅ Если нет попаданий — видимость есть
     }
-
 
     private string ConvertDegreesToDMS(float degrees)
     {
@@ -502,168 +484,157 @@ public class GeodeticNetworkGeneratorhand : MonoBehaviour
         public string stderr;
         public string report;
     }
-
     // ==========================================================================
-    //                           NETWORK REPORT (3D)
+    //                           NETWORK REPORT (3D, с анализом геометрии)
     // ==========================================================================
 
     public void PrintNetworkReport()
     {
         if (grades == null || grades.Count == 0)
         {
-            Debug.LogWarning("Нет марок — отчёт сети невозможен.");
+            Debug.LogWarning("Нет марок — отчёт невозможен.");
             return;
         }
 
         if (selectedStations.Count < 2)
         {
-            Debug.LogWarning($"Недостаточно станций ({selectedStations.Count}). Минимум: 2");
+            Debug.LogWarning($"Недостаточно станций: {selectedStations.Count}");
             return;
         }
 
-        // Вычисляем параметры сети
-        double cond;
-        double[,] covariance;
-        bool ok = ComputeConditionNumberAndInverse(out cond, out covariance);
-
-        Debug.Log("=== ГЕОДЕЗИЧЕСКИЙ ОТЧЁТ СЕТИ ===");
-        Debug.Log($"Количество марок: {grades.Count}");
-        Debug.Log($"Количество станций: {selectedStations.Count}");
-
-        if (ok)
+        // ===== 1. СЫРАЯ НОРМАЛЬНАЯ МАТРИЦА =====
+        double[,] N_raw = BuildRawNormalMatrix();
+        if (N_raw == null || N_raw.GetLength(0) == 0)
         {
-            Debug.Log($"Число обусловленности сети: {cond:N0}");
-
-            // Классификация сети по ГОСТ
-            if (cond < 1000)
-                Debug.Log($"Класс сети: ВЫСОКОЙ ТОЧНОСТИ (cond < 1000)");
-            else if (cond < 5000)
-                Debug.Log($"Класс сети: СТАНДАРТНАЯ (cond < 5000)");
-            else if (cond < 20000)
-                Debug.Log($"Класс сети: ТЕХНИЧЕСКАЯ (cond < 20000)");
-            else
-                Debug.Log($"Класс сети: НИЗКОЙ ТОЧНОСТИ (cond > 20000)");
-
-            // Анализ ошибок положения марок
-            Debug.Log("=== ОШИБКИ ПОЛОЖЕНИЯ МАРОК ===");
-
-            double maxError = 0;
-            double avgError = 0;
-            int validPoints = 0;
-
-            for (int gi = 0; gi < grades.Count; gi++)
-            {
-                int idx = gi * 3;
-                if (idx + 2 >= covariance.GetLength(0)) continue;
-
-                try
-                {
-                    double sigmaX = Math.Sqrt(Math.Abs(covariance[idx, idx]));
-                    double sigmaY = Math.Sqrt(Math.Abs(covariance[idx + 1, idx + 1]));
-                    double sigmaZ = Math.Sqrt(Math.Abs(covariance[idx + 2, idx + 2]));
-
-                    double positionError = Math.Sqrt(sigmaX * sigmaX + sigmaY * sigmaY + sigmaZ * sigmaZ);
-                    double horizontalError = Math.Sqrt(sigmaX * sigmaX + sigmaZ * sigmaZ);
-
-                    maxError = Math.Max(maxError, positionError);
-                    avgError += positionError;
-                    validPoints++;
-
-                    Debug.Log($"Марка {grades[gi].name}: " +
-                             $"σX={sigmaX * 1000:F1} мм, " +
-                             $"σY={sigmaY * 1000:F1} мм, " +
-                             $"σZ={sigmaZ * 1000:F1} мм, " +
-                             $"σгор={horizontalError * 1000:F1} мм, " +
-                             $"σпол={positionError * 1000:F1} мм");
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogWarning($"Ошибка расчета для марки {grades[gi].name}: {ex.Message}");
-                }
-            }
-
-            if (validPoints > 0)
-            {
-                avgError /= validPoints;
-                Debug.Log($"Средняя ошибка положения: {avgError * 1000:F1} мм");
-                Debug.Log($"Максимальная ошибка: {maxError * 1000:F1} мм");
-
-                if (maxError > 0.01)
-                    Debug.LogWarning("ВНИМАНИЕ: Максимальная ошибка превышает 10 мм!");
-                else if (maxError > 0.005)
-                    Debug.Log("Сеть соответствует требованиям средней точности");
-                else if (maxError > 0.002)
-                    Debug.Log("Сеть соответствует требованиям высокой точности");
-                else
-                    Debug.Log("Сеть соответствует требованиям прецизионных измерений");
-            }
+            Debug.LogError("Не удалось построить нормальную матрицу.");
+            return;
         }
+
+        // ===== 2. СПЕКТРАЛЬНЫЙ АНАЛИЗ =====
+        if (!JacobiEigenDecomposition(N_raw, out double[] eig_raw, out _))
+        {
+            Debug.LogError("Не удалось выполнить спектральный анализ сырой матрицы.");
+            return;
+        }
+
+        Array.Sort(eig_raw);
+
+        // ✅ ОБЪЯВЛЯЕМ threshold ОДИН РАЗ в начале метода
+        double threshold = eig_raw[eig_raw.Length - 1] * 1e-12;
+
+        int zeroCount = 0;
+        for (int i = 0; i < Math.Min(7, eig_raw.Length); i++)
+            if (eig_raw[i] < threshold) zeroCount++;
+
+        Debug.Log("=== АНАЛИЗ СПЕКТРА СОБСТВЕННЫХ ЗНАЧЕНИЙ ===");
+        Debug.Log($"Неопределённых степеней свободы: {zeroCount}/7");
+        if (zeroCount > 0)
+            Debug.LogWarning($"СЕТЬ ИМЕЕТ {zeroCount} НЕОПРЕДЕЛЁННЫХ СТЕПЕНЕЙ СВОБОДЫ!");
+
+        // ===== 3. ЧИСЛО ОБУСЛОВЛЕННОСТИ ГЕОМЕТРИИ =====
+        int startIdx = 7;
+        double cond_geometric = double.PositiveInfinity;
+
+        if (eig_raw.Length > startIdx)
+        {
+            double lambda_min = eig_raw[startIdx];
+            double lambda_max = eig_raw[eig_raw.Length - 1];
+
+            // ✅ ИСПОЛЬЗУЕМ существующий threshold (не объявляем заново!)
+            cond_geometric = (lambda_min < threshold) ? double.PositiveInfinity : lambda_max / lambda_min;
+        }
+
+        // ===== 4. КОВАРИАЦИОННАЯ МАТРИЦА =====
+        if (!ComputeConditionNumberAndInverse(out _, out double[,] invN) || invN == null)
+        {
+            Debug.LogError("Не удалось получить ковариационную матрицу (N⁻¹).");
+            return;
+        }
+
+        int n = invN.GetLength(0);
+
+        // ===== 5. ОТЧЁТ =====
+        Debug.Log("\n=== ОТЧЁТ О ГЕОМЕТРИИ И ТОЧНОСТИ СЕТИ ===");
+        Debug.Log($"Марок: {grades.Count}");
+        Debug.Log($"Станций: {selectedStations.Count}");
+        Debug.Log($"Число обусловленности (геометрия сети): {cond_geometric:N0}");
+
+        if (double.IsInfinity(cond_geometric) || cond_geometric > 1e8)
+            Debug.LogError("Геометрия сети: КАТАСТРОФИЧЕСКИ ПЛОХАЯ (вырожденная)");
+        else if (cond_geometric < 1e3)
+            Debug.Log("Геометрия сети: ОТЛИЧНАЯ");
+        else if (cond_geometric < 5e3)
+            Debug.Log("Геометрия сети: ХОРОШАЯ");
+        else if (cond_geometric < 1e5)
+            Debug.LogWarning("Геометрия сети: ДОПУСТИМАЯ (но требует внимания)");
         else
+            Debug.LogError("Геометрия сети: СЛАБАЯ (риск потери точности)");
+
+        // ===== 6. ОЦЕНКА ТОЧНОСТИ МАРОК =====
+        Debug.Log("\n=== ОЦЕНКА ОТНОСИТЕЛЬНОЙ ТОЧНОСТИ (σ₀ = 1) ===");
+
+        double maxSigma = 0, sumSigma = 0;
+        int count = 0;
+        int offset = 3 * selectedStations.Count;
+
+        for (int i = 0; i < grades.Count; i++)
         {
-            Debug.LogError("Не удалось вычислить параметры сети. Возможно сеть вырождена.");
+            int k = offset + i * 3;
+            if (k + 2 >= n) continue;
+
+            double sx = Math.Sqrt(Math.Max(0, invN[k, k]));
+            double sy = Math.Sqrt(Math.Max(0, invN[k + 1, k + 1]));
+            double sz = Math.Sqrt(Math.Max(0, invN[k + 2, k + 2]));
+
+            double sigmaPlan = Math.Sqrt(sx * sx + sz * sz);
+            double sigma3D = Math.Sqrt(sx * sx + sy * sy + sz * sz);
+
+            maxSigma = Math.Max(maxSigma, sigma3D);
+            sumSigma += sigma3D;
+            count++;
+
+            Debug.Log(
+                $"Марка {grades[i].name}: " +
+                $"σX={FormatSigmaMm(sx)}, σY={FormatSigmaMm(sy)}, σZ={FormatSigmaMm(sz)}, " +
+                $"σплан={FormatSigmaMm(sigmaPlan)}, σ3D={FormatSigmaMm(sigma3D)}"
+            );
         }
 
-        // Анализ геометрии сети
-        Debug.Log("=== АНАЛИЗ ГЕОМЕТРИИ СЕТИ ===");
-
-        var coveredGrades = new HashSet<Transform>();
-        foreach (var station in selectedStations)
+        if (count > 0)
         {
-            if (station.visibleGrades != null)
-                coveredGrades.UnionWith(station.visibleGrades);
+            Debug.Log($"\nСредняя σ3D: {FormatSigmaMm(sumSigma / count)}");
+            Debug.Log($"Максимальная σ3D: {FormatSigmaMm(maxSigma)}");
         }
 
-        Debug.Log($"Покрыто марок: {coveredGrades.Count}/{grades.Count} ({coveredGrades.Count / (float)grades.Count * 100:F1}%)");
+        // ===== 7. АНАЛИЗ ПОКРЫТИЯ =====
+        Debug.Log("\n=== АНАЛИЗ ПОКРЫТИЯ ===");
+        var covered = new HashSet<Transform>();
+        foreach (var st in selectedStations)
+            if (st.visibleGrades != null)
+                covered.UnionWith(st.visibleGrades);
 
-        var uncoveredGrades = grades.Where(g => !coveredGrades.Contains(g)).ToList();
-        if (uncoveredGrades.Count > 0)
-        {
-            Debug.LogWarning($"Непокрытые марки ({uncoveredGrades.Count}): {string.Join(", ", uncoveredGrades.Select(g => g.name))}");
-        }
+        Debug.Log($"Покрыто марок: {covered.Count}/{grades.Count}");
 
-        int goodAngles = 0;
-        int badAngles = 0;
+        var uncovered = grades.Where(g => !covered.Contains(g)).ToList();
+        if (uncovered.Count > 0)
+            Debug.LogWarning("Непокрытые марки: " + string.Join(", ", uncovered.Select(g => g.name)));
 
-        foreach (var grade in grades)
-        {
-            var observingStations = selectedStations
-                .Where(s => s.visibleGrades != null && s.visibleGrades.Contains(grade))
-                .ToList();
+        // ===== 8. АНАЛИЗ ГЕОМЕТРИИ =====
+        AnalyzeGeometry();
 
-            if (observingStations.Count >= 2)
-            {
-                bool hasGoodAngle = false;
-                for (int i = 0; i < observingStations.Count - 1; i++)
-                {
-                    for (int j = i + 1; j < observingStations.Count; j++)
-                    {
-                        Vector3 dir1 = observingStations[i].position - grade.position;
-                        Vector3 dir2 = observingStations[j].position - grade.position;
-                        float angle = Vector3.Angle(dir1, dir2);
-
-                        if (angle >= 30f && angle <= 150f)
-                            hasGoodAngle = true;
-                    }
-                }
-
-                if (hasGoodAngle)
-                    goodAngles++;
-                else
-                    badAngles++;
-            }
-        }
-
-        Debug.Log($"Марок с хорошей геометрией: {goodAngles}");
-        Debug.Log($"Марок с плохой геометрией: {badAngles}");
-
-        if (badAngles > grades.Count * 0.2f)
-            Debug.LogWarning("Более 20% марок имеют неудовлетворительную геометрию засечки!");
-
-        Debug.Log("=== ОТЧЁТ ЗАВЕРШЁН ===");
+        Debug.Log("\n=== ОТЧЁТ ЗАВЕРШЁН ===");
+    }
+    private string FormatSigmaMm(double sigmaMeters)
+    {
+        double mm = sigmaMeters * 1000.0;
+        if (double.IsNaN(mm) || double.IsInfinity(mm)) return "n/a";
+        if (mm >= 0.05) return $"{mm:F1}мм";
+        if (mm >= 0.0001) return $"{mm:F4}мм";
+        return $"{mm:E2}мм";
     }
 
     // ==========================================================================
-    //         NORMAL MATRIX + CONDITION NUMBER + PSEUDOINVERSE (3D)
+    //         CONDITION NUMBER + INVERSE (3D, Unity)
     // ==========================================================================
 
     private bool ComputeConditionNumberAndInverse(out double condValue, out double[,] invN)
@@ -671,9 +642,9 @@ public class GeodeticNetworkGeneratorhand : MonoBehaviour
         condValue = double.PositiveInfinity;
         invN = null;
 
-        double quality;
-        double[,] N = ComputeNormalMatrix(out quality);
-        if (N == null) return false;
+        // ✅ ИСПРАВЛЕНО: out bool вместо out double
+        double[,] N = ComputeNormalMatrix(out bool isDegenerate);
+        if (N == null || isDegenerate) return false;
 
         int n = N.GetLength(0);
 
@@ -685,7 +656,6 @@ public class GeodeticNetworkGeneratorhand : MonoBehaviour
 
         double minEig = double.MaxValue;
         double maxEig = double.MinValue;
-
         for (int i = 0; i < eig.Length; i++)
         {
             if (eig[i] < minEig) minEig = eig[i];
@@ -694,29 +664,24 @@ public class GeodeticNetworkGeneratorhand : MonoBehaviour
 
         if (minEig <= 1e-15)
         {
-            Debug.LogWarning("Минимальное собственное значение ~ 0 — сеть вырождена.");
+            Debug.LogWarning("Минимальное собственное значение ~0 — сеть вырождена.");
             return false;
         }
 
         condValue = maxEig / minEig;
 
-        // формируем псевдообратную N⁻¹ = V * Λ⁻¹ * Vᵀ
         invN = new double[n, n];
-
-        for (int k = 0; k < eig.Length; k++)
+        for (int k = 0; k < n; k++)
         {
             double λinv = eig[k] > 1e-15 ? 1.0 / eig[k] : 0.0;
-
             for (int i = 0; i < n; i++)
             {
                 double vik = eigVec[i, k];
                 if (Math.Abs(vik) < 1e-15) continue;
-
                 for (int j = 0; j < n; j++)
                 {
                     double vjk = eigVec[j, k];
                     if (Math.Abs(vjk) < 1e-15) continue;
-
                     invN[i, j] += vik * λinv * vjk;
                 }
             }
@@ -726,174 +691,283 @@ public class GeodeticNetworkGeneratorhand : MonoBehaviour
     }
 
     // ==========================================================================
-    //                 NORMAL MATRIX BUILDER (3D OBSERVATIONS)
+    //                 NORMAL MATRIX BUILDER (3D, ПОЛНАЯ ВЕРСИЯ)
     // ==========================================================================
 
-    private double[,] ComputeNormalMatrix(out double quality)
+    private double[,] ComputeNormalMatrix(out bool isDegenerate)
     {
-        quality = double.PositiveInfinity;
+        isDegenerate = false;
 
-        int M = grades.Count;
-        if (M == 0) return null;
+        int nGrades = grades?.Count ?? 0;
+        int nStations = selectedStations?.Count ?? 0;
+        if (nGrades < 1 || nStations < 1) return null;
 
-        int n = M * 3;
+        // ✅ ПОЛНАЯ МАТРИЦА: станции + марки
+        int n = 3 * (nStations + nGrades);
         double[,] N = new double[n, n];
 
-        // параметры весов наблюдений
+        // ===== ВЕСА ИЗМЕРЕНИЙ =====
         double sigmaDist = Math.Max(1e-6, DistanceStdevMm / 1000.0);
         double wDist = 1.0 / (sigmaDist * sigmaDist);
+        double sigmaAng_rad = (DirectionStdevCc / 100.0) * (Math.PI / (180.0 * 3600.0));
+        double wAng = 1.0 / (sigmaAng_rad * sigmaAng_rad);
 
-        double sigmaAng = (DirectionStdevCc / 3600.0) * Math.PI / 180.0; // ИСПРАВЛЕНО: 3600 сек/градус
-        double wAng = 1.0 / (sigmaAng * sigmaAng);
-
-        // --- наполняем N ---
-        for (int si = 0; si < selectedStations.Count; si++)
+        // ===== ОБХОД СТАНЦИЙ =====
+        for (int si = 0; si < nStations; si++)
         {
             var st = selectedStations[si];
-            if (st == null || st.ms60 == null) continue;
+            if (st?.ms60?.position == null) continue;
 
             Vector3 S = st.ms60.position;
 
-            // находим видимые марки
-            var visible = new List<(int idx, Transform g)>();
-
-            for (int gi = 0; gi < M; gi++)
+            // Сбор видимых марок
+            var visible = new List<(int idx, Vector3 p)>();
+            for (int gi = 0; gi < nGrades; gi++)
             {
-                var g = grades[gi];
-                if (g == null) continue;
-
-                if (HasLineOfSight(st.ms60, g))
-                    visible.Add((gi, g));
+                if (grades[gi] == null) continue;
+                if (HasLineOfSight(st.ms60, grades[gi]))
+                    visible.Add((gi, grades[gi].position));
             }
+            if (visible.Count < 1) continue;
 
-            if (visible.Count == 0) continue;
-
-            // расстояния + вертикальные углы
-            foreach (var item in visible)
+            // === РАССТОЯНИЯ ===
+            foreach (var v in visible)
             {
-                int gi = item.idx;
-                Transform g = item.g;
-
-                Vector3 P = g.position;
-                Vector3 d = P - S;
-
-                double dx = d.x;
-                double dy = d.y;
-                double dz = d.z;
-
+                Vector3 d = v.p - S;
+                double dx = d.x, dy = d.y, dz = d.z;
                 double r = Math.Sqrt(dx * dx + dy * dy + dz * dz);
-                if (r < 1e-9) continue;
+                if (r < 1e-6) continue;
 
-                int bi = gi * 3;
+                int siIdx = si * 3;
+                int giIdx = (nStations + v.idx) * 3;
 
-                // ------------ расстояние ------------
-                {
-                    double[] row = new double[n];
-                    row[bi + 0] = dx / r;
-                    row[bi + 1] = dy / r;
-                    row[bi + 2] = dz / r;
-                    AccumulateRowToN(N, row, wDist);
-                }
+                double[] row = new double[n];
+                row[siIdx + 0] = -dx / r; row[siIdx + 1] = -dy / r; row[siIdx + 2] = -dz / r;
+                row[giIdx + 0] = dx / r; row[giIdx + 1] = dy / r; row[giIdx + 2] = dz / r;
 
-                // ------------ вертикальный угол ------------
-                double h = Math.Sqrt(dx * dx + dz * dz);
-                if (h > 0.2)
-                {
-                    double denom = h * (h * h + dy * dy);
-                    if (Math.Abs(denom) > 1e-15)
-                    {
-                        double dvdx = (-dy * dx) / denom;
-                        double dvdz = (-dy * dz) / denom;
-                        double dvdy = h / (h * h + dy * dy);
-
-                        double[] rowV = new double[n];
-                        rowV[bi + 0] = dvdx;
-                        rowV[bi + 1] = dvdy;
-                        rowV[bi + 2] = dvdz;
-                        AccumulateRowToN(N, rowV, wAng);
-                    }
-                }
+                AccumulateRowToN(N, row, wDist);
             }
 
-            // горизонтальные углы — пары марок
-            if (visible.Count >= 2)
+            // === УГЛЫ ===
+            for (int i = 0; i < visible.Count - 1; i++)
             {
-                for (int a = 0; a < visible.Count - 1; a++)
+                for (int j = i + 1; j < visible.Count; j++)
                 {
-                    for (int b = a + 1; b < visible.Count; b++)
+                    Vector3 p1 = visible[i].p - S;
+                    Vector3 p2 = visible[j].p - S;
+
+                    int siIdx = si * 3;
+                    int gi1Idx = (nStations + visible[i].idx) * 3;
+                    int gi2Idx = (nStations + visible[j].idx) * 3;
+
+                    // Горизонтальный угол (плоскость XZ)
+                    double h1_sq = p1.x * p1.x + p1.z * p1.z;
+                    double h2_sq = p2.x * p2.x + p2.z * p2.z;
+                    if (h1_sq > 1e-12 && h2_sq > 1e-12)
                     {
-                        int i1 = visible[a].idx;
-                        int i2 = visible[b].idx;
+                        double[] rowHor = new double[n];
+                        rowHor[gi1Idx + 0] = p1.z / h1_sq; rowHor[gi1Idx + 2] = -p1.x / h1_sq;
+                        rowHor[gi2Idx + 0] = -p2.z / h2_sq; rowHor[gi2Idx + 2] = p2.x / h2_sq;
+                        rowHor[siIdx + 0] = -rowHor[gi1Idx + 0] - rowHor[gi2Idx + 0];
+                        rowHor[siIdx + 2] = -rowHor[gi1Idx + 2] - rowHor[gi2Idx + 2];
+                        AccumulateRowToN(N, rowHor, wAng);
+                    }
 
-                        Vector3 p1 = visible[a].g.position - S;
-                        Vector3 p2 = visible[b].g.position - S;
+                    // Вертикальный угол
+                    double r1 = Math.Sqrt(p1.x * p1.x + p1.y * p1.y + p1.z * p1.z);
+                    double r2 = Math.Sqrt(p2.x * p2.x + p2.y * p2.y + p2.z * p2.z);
+                    double h1 = Math.Sqrt(h1_sq);
+                    double h2 = Math.Sqrt(h2_sq);
+                    if (r1 > 1e-6 && r2 > 1e-6 && h1 > 1e-6 && h2 > 1e-6)
+                    {
+                        double[] rowVer = new double[n];
+                        double denom1 = r1 * r1 * h1;
+                        rowVer[gi1Idx + 0] = -(p1.x * p1.y) / denom1;
+                        rowVer[gi1Idx + 1] = h1 / (r1 * r1);
+                        rowVer[gi1Idx + 2] = -(p1.z * p1.y) / denom1;
 
-                        double dx1 = p1.x;
-                        double dz1 = p1.z;
-                        double dx2 = p2.x;
-                        double dz2 = p2.z;
+                        double denom2 = r2 * r2 * h2;
+                        rowVer[gi2Idx + 0] = (p2.x * p2.y) / denom2;
+                        rowVer[gi2Idx + 1] = -h2 / (r2 * r2);
+                        rowVer[gi2Idx + 2] = (p2.z * p2.y) / denom2;
 
-                        double d1 = dx1 * dx1 + dz1 * dz1;
-                        double d2 = dx2 * dx2 + dz2 * dz2;
-                        if (d1 < 1e-12 || d2 < 1e-12) continue;
+                        rowVer[siIdx + 0] = -rowVer[gi1Idx + 0] - rowVer[gi2Idx + 0];
+                        rowVer[siIdx + 1] = -rowVer[gi1Idx + 1] - rowVer[gi2Idx + 1];
+                        rowVer[siIdx + 2] = -rowVer[gi1Idx + 2] - rowVer[gi2Idx + 2];
 
-                        double dth_dx1 = dz1 / d1;
-                        double dth_dz1 = -dx1 / d1;
-                        double dth_dx2 = -dz2 / d2;
-                        double dth_dz2 = dx2 / d2;
-
-                        double[] rowH = new double[n];
-
-                        int bi1 = i1 * 3;
-                        int bi2 = i2 * 3;
-
-                        rowH[bi1 + 0] = dth_dx1;
-                        rowH[bi1 + 2] = dth_dz1;
-
-                        rowH[bi2 + 0] = dth_dx2;
-                        rowH[bi2 + 2] = dth_dz2;
-
-                        AccumulateRowToN(N, rowH, wAng);
+                        AccumulateRowToN(N, rowVer, wAng);
                     }
                 }
             }
         }
 
-        // === ФИКСАЦИЯ БАЗИСА СЕТИ (ОБЯЗАТЕЛЬНО) ===
-        // Марка 0 — фиксируем X, Y, Z
-        if (M > 0)
+        // ===== ФИКСАЦИЯ ДАТУМА (7 условий Хельмерта) =====
+        if (nStations >= 1)
         {
-            int b0 = 0 * 3;
-            N[b0 + 0, b0 + 0] += 1e6;
-            N[b0 + 1, b0 + 1] += 1e6;
-            N[b0 + 2, b0 + 2] += 1e6;
+            N[0, 0] += 1e12; N[1, 1] += 1e12; N[2, 2] += 1e12;
         }
-
-        // Марка 1 — фиксируем X и Z (убираем поворот и масштаб)
-        if (M > 1)
+        if (nStations >= 2)
         {
-            int b1 = 1 * 3;
-            N[b1 + 0, b1 + 0] += 1e6;
-            N[b1 + 2, b1 + 2] += 1e6;
+            N[5, 5] += 1e12; N[4, 4] += 1e12;
+            Vector3 s1 = selectedStations[0].ms60.position;
+            Vector3 s2 = selectedStations[1].ms60.position;
+            double dx = s2.x - s1.x, dy = s2.y - s1.y, dz = s2.z - s1.z;
+            double dist_sq = dx * dx + dy * dy + dz * dz;
+            if (dist_sq > 1e-12)
+            {
+                double w_scale = 1e12 / dist_sq;
+                for (int i = 0; i < 6; i++)
+                    for (int j = 0; j < 6; j++)
+                    {
+                        double val = (i < 3 ? (j < 3 ? 1 : -1) : (j < 3 ? -1 : 1)) *
+                                     new[] { dx, dy, dz, dx, dy, dz }[i] * new[] { dx, dy, dz, dx, dy, dz }[j];
+                        N[i, j] += w_scale * val;
+                    }
+            }
         }
+        if (nStations >= 3) { N[8, 8] += 1e12; }
 
-        // общая регуляризация
-        for (int i = 0; i < n; i++)
-            N[i, i] += 1e-9;
+        // Регуляризация
+        const double regularization = 1e-10;
+        for (int i = 0; i < n; i++) N[i, i] += regularization;
 
-        // оцениваем качество как cond
+        // Проверка вырожденности
         if (!JacobiEigenDecomposition(N, out double[] ev, out _))
         {
-            quality = double.PositiveInfinity;
+            isDegenerate = true;
             return N;
         }
 
-        double minE = ev.Min();
-        double maxE = ev.Max();
-
-        quality = (minE <= 1e-15) ? double.PositiveInfinity : maxE / minE;
+        double minEig = ev.Min();
+        isDegenerate = (minEig < regularization * 0.1);
 
         return N;
+    }
+
+    // ==========================================================================
+    //                 BUILD RAW NORMAL MATRIX (без фиксации)
+    // ==========================================================================
+
+    private double[,] BuildRawNormalMatrix()
+    {
+        int nGrades = grades?.Count ?? 0;
+        int nStations = selectedStations?.Count ?? 0;
+        if (nGrades < 1 || nStations < 1) return null;
+
+        int n = 3 * (nStations + nGrades);
+        double[,] N = new double[n, n];
+
+        double sigmaDist = Math.Max(1e-6, DistanceStdevMm / 1000.0);
+        double wDist = 1.0 / (sigmaDist * sigmaDist);
+        double sigmaAng_rad = (DirectionStdevCc / 100.0) * (Math.PI / (180.0 * 3600.0));
+        double wAng = 1.0 / (sigmaAng_rad * sigmaAng_rad);
+
+        for (int si = 0; si < nStations; si++)
+        {
+            var st = selectedStations[si];
+            if (st?.ms60?.position == null) continue;
+
+            Vector3 S = st.ms60.position;
+
+            var visible = new List<(int idx, Vector3 p)>();
+            for (int gi = 0; gi < nGrades; gi++)
+            {
+                if (grades[gi] == null) continue;
+                if (HasLineOfSight(st.ms60, grades[gi]))
+                    visible.Add((gi, grades[gi].position));
+            }
+            if (visible.Count < 1) continue;
+
+            foreach (var v in visible)
+            {
+                Vector3 d = v.p - S;
+                double dx = d.x, dy = d.y, dz = d.z;
+                double r = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+                if (r < 1e-6) continue;
+
+                int siIdx = si * 3;
+                int giIdx = (nStations + v.idx) * 3;
+
+                double[] row = new double[n];
+                row[siIdx + 0] = -dx / r; row[siIdx + 1] = -dy / r; row[siIdx + 2] = -dz / r;
+                row[giIdx + 0] = dx / r; row[giIdx + 1] = dy / r; row[giIdx + 2] = dz / r;
+
+                AccumulateRowToN(N, row, wDist);
+            }
+
+            for (int i = 0; i < visible.Count - 1; i++)
+            {
+                for (int j = i + 1; j < visible.Count; j++)
+                {
+                    Vector3 p1 = visible[i].p - S;
+                    Vector3 p2 = visible[j].p - S;
+
+                    int siIdx = si * 3;
+                    int gi1Idx = (nStations + visible[i].idx) * 3;
+                    int gi2Idx = (nStations + visible[j].idx) * 3;
+
+                    double h1_sq = p1.x * p1.x + p1.z * p1.z;
+                    double h2_sq = p2.x * p2.x + p2.z * p2.z;
+                    if (h1_sq > 1e-12 && h2_sq > 1e-12)
+                    {
+                        double[] rowHor = new double[n];
+                        rowHor[gi1Idx + 0] = p1.z / h1_sq; rowHor[gi1Idx + 2] = -p1.x / h1_sq;
+                        rowHor[gi2Idx + 0] = -p2.z / h2_sq; rowHor[gi2Idx + 2] = p2.x / h2_sq;
+                        rowHor[siIdx + 0] = -rowHor[gi1Idx + 0] - rowHor[gi2Idx + 0];
+                        rowHor[siIdx + 2] = -rowHor[gi1Idx + 2] - rowHor[gi2Idx + 2];
+                        AccumulateRowToN(N, rowHor, wAng);
+                    }
+
+                    double r1 = Math.Sqrt(p1.x * p1.x + p1.y * p1.y + p1.z * p1.z);
+                    double r2 = Math.Sqrt(p2.x * p2.x + p2.y * p2.y + p2.z * p2.z);
+                    double h1 = Math.Sqrt(h1_sq);
+                    double h2 = Math.Sqrt(h2_sq);
+                    if (r1 > 1e-6 && r2 > 1e-6 && h1 > 1e-6 && h2 > 1e-6)
+                    {
+                        double[] rowVer = new double[n];
+                        double denom1 = r1 * r1 * h1;
+                        rowVer[gi1Idx + 0] = -(p1.x * p1.y) / denom1;
+                        rowVer[gi1Idx + 1] = h1 / (r1 * r1);
+                        rowVer[gi1Idx + 2] = -(p1.z * p1.y) / denom1;
+
+                        double denom2 = r2 * r2 * h2;
+                        rowVer[gi2Idx + 0] = (p2.x * p2.y) / denom2;
+                        rowVer[gi2Idx + 1] = -h2 / (r2 * r2);
+                        rowVer[gi2Idx + 2] = (p2.z * p2.y) / denom2;
+
+                        rowVer[siIdx + 0] = -rowVer[gi1Idx + 0] - rowVer[gi2Idx + 0];
+                        rowVer[siIdx + 1] = -rowVer[gi1Idx + 1] - rowVer[gi2Idx + 1];
+                        rowVer[siIdx + 2] = -rowVer[gi1Idx + 2] - rowVer[gi2Idx + 2];
+
+                        AccumulateRowToN(N, rowVer, wAng);
+                    }
+                }
+            }
+        }
+
+        return N;
+    }
+    // ==========================================================================
+    //                         UTILITY: ACCUMULATOR
+    // ==========================================================================
+
+    private void AccumulateRowToN(double[,] N, double[] row, double weight)
+    {
+        int n = N.GetLength(0);
+
+        for (int i = 0; i < n; i++)
+        {
+            double ri = row[i];
+            if (Math.Abs(ri) < 1e-16) continue;
+
+            for (int j = 0; j < n; j++)
+            {
+                double rj = row[j];
+                if (Math.Abs(rj) < 1e-16) continue;
+
+                N[i, j] += weight * ri * rj;
+            }
+        }
     }
 
     // ==========================================================================
@@ -974,28 +1048,49 @@ public class GeodeticNetworkGeneratorhand : MonoBehaviour
     }
 
     // ==========================================================================
-    //                         UTILITY: ACCUMULATOR
+    //                         GEOMETRY ANALYSIS
     // ==========================================================================
 
-    private void AccumulateRowToN(double[,] N, double[] row, double weight)
+    private void AnalyzeGeometry()
     {
-        int n = N.GetLength(0);
+        var covered = new HashSet<Transform>();
+        foreach (var st in selectedStations)
+            if (st.visibleGrades != null)
+                covered.UnionWith(st.visibleGrades);
 
-        for (int i = 0; i < n; i++)
+        Debug.Log($"Покрытие: {covered.Count}/{grades.Count}");
+
+        int good = 0, bad = 0;
+        foreach (var g in grades)
         {
-            double ri = row[i];
-            if (Math.Abs(ri) < 1e-16) continue;
+            var stations = selectedStations
+                .Where(s => s.visibleGrades != null && s.visibleGrades.Contains(g))
+                .ToList();
 
-            for (int j = 0; j < n; j++)
+            if (stations.Count < 2) continue;
+
+            bool ok = false;
+            for (int i = 0; i < stations.Count - 1 && !ok; i++)
             {
-                double rj = row[j];
-                if (Math.Abs(rj) < 1e-16) continue;
+                for (int j = i + 1; j < stations.Count; j++)
+                {
+                    float angle = Vector3.Angle(
+                        stations[i].position - g.position,
+                        stations[j].position - g.position);
 
-                N[i, j] += weight * ri * rj;
+                    if (angle >= 30 && angle <= 150)
+                    {
+                        ok = true;
+                        break;
+                    }
+                }
             }
+            if (ok) good++; else bad++;
         }
-    }
 
+        Debug.Log($"Хорошая геометрия (30°-150°): {good}");
+        Debug.Log($"Плохая геометрия: {bad}");
+    }
     private bool ComputeConditionNumberSVD(out double condValue, out double[,] invN)
     {
         condValue = double.PositiveInfinity;
@@ -1003,8 +1098,8 @@ public class GeodeticNetworkGeneratorhand : MonoBehaviour
 
         // Используем 3D-версию матрицы с параметром out double
         double quality;
-        double[,] N = ComputeNormalMatrix(out quality);
-        if (N == null) return false;
+        double[,] N = ComputeNormalMatrix(out bool isDegenerate);
+        if (N == null || isDegenerate) return false;
 
         int n = N.GetLength(0);
 
