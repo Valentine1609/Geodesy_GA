@@ -30,6 +30,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     public TMP_InputField directionStdevInput;
     [Header("UI")]
     public TMP_Text resultText;
+    public TMP_Text networkReportUIText;
     [Header("UI")]
     public TMP_InputField distanceStdevInput;
     [Header("Шум координат (мм)")]
@@ -2279,113 +2280,185 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     }
 
     // ==========================================================================
-    //                           NETWORK REPORT
+    //                    UI OUTPUT HELPERS (добавить в класс)
+    // ==========================================================================
+
+    private void AppendToNetworkReportUI(string message)
+    {
+        if (networkReportUIText != null)
+        {
+            networkReportUIText.text += message + "\n";
+
+            // Автопрокрутка вниз через Canvas.ForceUpdateCanvases()
+            Canvas.ForceUpdateCanvases();
+        }
+    }
+
+    private void ClearNetworkReportUI()
+    {
+        if (networkReportUIText != null)
+        {
+            networkReportUIText.text = "";
+        }
+    }
+
+
+    // ==========================================================================
+    //                           NETWORK REPORT (ПОЛНЫЙ С UI)
     // ==========================================================================
 
     public void PrintNetworkReport()
     {
+        // ✅ Очищаем предыдущий отчёт в UI
+        ClearNetworkReportUI();
+
         if (grades == null || grades.Count == 0)
         {
-            Debug.LogWarning("Нет марок — отчёт невозможен.");
+            string msg = "Нет марок — отчёт невозможен.";
+            Debug.LogWarning(msg);
+            AppendToNetworkReportUI($"⚠️ {msg}");
             return;
         }
 
         if (selectedStations.Count < minStations)
         {
-            Debug.LogWarning($"Недостаточно станций: {selectedStations.Count} < {minStations}");
+            string msg = $"Недостаточно станций: {selectedStations.Count} < {minStations}";
+            Debug.LogWarning(msg);
+            AppendToNetworkReportUI($"⚠️ {msg}");
             return;
         }
 
-        // ===== 1. СЫРАЯ НОРМАЛЬНАЯ МАТРИЦА (чистая геометрия сети) =====
+        // ===== 1. СЫРАЯ НОРМАЛЬНАЯ МАТРИЦА =====
         double[,] N_raw = BuildRawNormalMatrix();
         if (N_raw == null || N_raw.GetLength(0) == 0)
         {
-            Debug.LogError("Не удалось построить нормальную матрицу.");
+            string msg = "Не удалось построить нормальную матрицу.";
+            Debug.LogError(msg);
+            AppendToNetworkReportUI($"❌ {msg}");
             return;
         }
 
-        // ===== 2. СПЕКТРАЛЬНЫЙ АНАЛИЗ СЫРОЙ МАТРИЦЫ =====
+        // ===== 2. СПЕКТРАЛЬНЫЙ АНАЛИЗ =====
         if (!JacobiEigenDecomposition(N_raw, out double[] eig_raw, out _))
         {
-            Debug.LogError("Не удалось выполнить спектральный анализ сырой матрицы.");
+            string msg = "Не удалось выполнить спектральный анализ сырой матрицы.";
+            Debug.LogError(msg);
+            AppendToNetworkReportUI($"❌ {msg}");
             return;
         }
 
-        Array.Sort(eig_raw); // сортируем по возрастанию
+        Array.Sort(eig_raw);
         double threshold = eig_raw[eig_raw.Length - 1] * 1e-12;
         int zeroCount = 0;
         for (int i = 0; i < Math.Min(7, eig_raw.Length); i++)
             if (eig_raw[i] < threshold) zeroCount++;
 
-        Debug.Log("=== АНАЛИЗ СПЕКТРА СОБСТВЕННЫХ ЗНАЧЕНИЙ ===");
-        Debug.Log($"Неопределённых степеней свободы: {zeroCount}/7");
-        if (zeroCount > 0)
-            Debug.LogWarning($"СЕТЬ ИМЕЕТ {zeroCount} НЕОПРЕДЕЛЁННЫХ СТЕПЕНЕЙ СВОБОДЫ!");
+        // ✅ Вывод в консоль и UI
+        string spectrumHeader = "\n=== 📊 АНАЛИЗ СПЕКТРА СОБСТВЕННЫХ ЗНАЧЕНИЙ ===";
+        Debug.Log(spectrumHeader);
+        AppendToNetworkReportUI(spectrumHeader);
 
-        // ===== 3. ЧИСЛО ОБУСЛОВЛЕННОСТИ ГЕОМЕТРИИ =====
-        // Пропускаем первые 6 собственных значений (3 сдвига + 3 поворота)
-        // Масштаб фиксирован измерениями расстояний
-        int startIdx = 7;
-        if (eig_raw.Length <= startIdx)
+        string zeroCountMsg = $"Неопределённых степеней свободы: {zeroCount}/7";
+        Debug.Log(zeroCountMsg);
+        AppendToNetworkReportUI(zeroCountMsg);
+
+        if (zeroCount > 0)
         {
-            Debug.LogError("Недостаточно измерений для оценки геометрии сети.");
-            return;
+            string warn = $"⚠️ СЕТЬ ИМЕЕТ {zeroCount} НЕОПРЕДЕЛЁННЫХ СТЕПЕНЕЙ СВОБОДЫ!";
+            Debug.LogWarning(warn);
+            AppendToNetworkReportUI(warn);
         }
 
-        double lambda_min = eig_raw[startIdx];
-        double lambda_max = eig_raw[eig_raw.Length - 1];
-        double cond_geometric = (lambda_min < threshold)
-            ? double.PositiveInfinity
-            : lambda_max / lambda_min;
+        // ===== 3. ЧИСЛО ОБУСЛОВЛЕННОСТИ =====
+        int startIdx = 7;
+        double cond_geometric = double.PositiveInfinity;
 
-        // ===== 4. КОВАРИАЦИОННАЯ МАТРИЦА (устойчивая псевдообратная) =====
+        if (eig_raw.Length > startIdx)
+        {
+            double lambda_min = eig_raw[startIdx];
+            double lambda_max = eig_raw[eig_raw.Length - 1];
+            cond_geometric = (lambda_min < threshold) ? double.PositiveInfinity : lambda_max / lambda_min;
+        }
+
+        // ===== 4. КОВАРИАЦИОННАЯ МАТРИЦА =====
         if (!ComputeConditionNumberAndInverse(out _, out double[,] invN) || invN == null)
         {
-            Debug.LogError("Не удалось получить ковариационную матрицу (N⁻¹).");
+            string msg = "Не удалось получить ковариационную матрицу (N⁻¹).";
+            Debug.LogError(msg);
+            AppendToNetworkReportUI($"❌ {msg}");
             return;
         }
 
         int n = invN.GetLength(0);
 
         // ===== 5. ОТЧЁТ =====
-        Debug.Log("\n=== ОТЧЁТ О ГЕОМЕТРИИ И ТОЧНОСТИ СЕТИ ===");
+        string reportHeader = "\n=== 📐 ОТЧЁТ О ГЕОМЕТРИИ И ТОЧНОСТИ СЕТИ ===";
+        Debug.Log(reportHeader);
+        AppendToNetworkReportUI(reportHeader);
+
         Debug.Log($"Марок: {grades.Count}");
+        AppendToNetworkReportUI($"🔹 Марок: {grades.Count}");
+
         Debug.Log($"Станций: {selectedStations.Count}");
+        AppendToNetworkReportUI($"🔹 Станций: {selectedStations.Count}");
+
+        string condMsg = $"🔹 Число обусловленности: {cond_geometric:N0}";
         Debug.Log($"Число обусловленности (геометрия сети): {cond_geometric:N0}");
+        AppendToNetworkReportUI(condMsg);
 
-        // Интерпретация числа обусловленности
+        // Интерпретация
+        string condStatus;
         if (double.IsInfinity(cond_geometric) || cond_geometric > 1e8)
+        {
+            condStatus = "❌ КАТАСТРОФИЧЕСКИ ПЛОХАЯ (вырожденная)";
             Debug.LogError("Геометрия сети: КАТАСТРОФИЧЕСКИ ПЛОХАЯ (вырожденная)");
+        }
         else if (cond_geometric < 1e3)
+        {
+            condStatus = "✅ ОТЛИЧНАЯ";
             Debug.Log("Геометрия сети: ОТЛИЧНАЯ");
+        }
         else if (cond_geometric < 5e3)
+        {
+            condStatus = "✅ ХОРОШАЯ";
             Debug.Log("Геометрия сети: ХОРОШАЯ");
+        }
         else if (cond_geometric < 1e5)
+        {
+            condStatus = "⚠️ ДОПУСТИМАЯ (но требует внимания)";
             Debug.LogWarning("Геометрия сети: ДОПУСТИМАЯ (но требует внимания)");
+        }
         else
+        {
+            condStatus = "❌ СЛАБАЯ (риск потери точности)";
             Debug.LogError("Геометрия сети: СЛАБАЯ (риск потери точности)");
+        }
+        AppendToNetworkReportUI($"🔹 Геометрия сети: {condStatus}");
 
-        // ===== 6. ОЦЕНКА ТОЧНОСТИ МАРОК (σ₀ = 1 — относительная оценка) =====
-        Debug.Log("\n=== ОЦЕНКА ОТНОСИТЕЛЬНОЙ ТОЧНОСТИ (σ₀ = 1) ===");
+        // ===== 6. ОЦЕНКА ТОЧНОСТИ =====
+        string accuracyHeader = "\n=== 🎯 ОЦЕНКА ОТНОСИТЕЛЬНОЙ ТОЧНОСТИ (σ₀ = 1) ===";
+        Debug.Log(accuracyHeader);
+        AppendToNetworkReportUI(accuracyHeader);
+
+        string accuracyNote = "⚠️ Для абсолютных ошибок требуется апостериорная дисперсия из невязок!";
         Debug.Log("Внимание: для абсолютных ошибок требуется апостериорная дисперсия из невязок!");
+        AppendToNetworkReportUI(accuracyNote);
 
         double maxSigma = 0, sumSigma = 0;
         int count = 0;
         int almostZeroPrintedCount = 0;
-        int offset = 3 * selectedStations.Count; // марки начинаются после станций
+        int offset = 3 * selectedStations.Count;
 
         for (int i = 0; i < grades.Count; i++)
         {
             int k = offset + i * 3;
             if (k + 2 >= n) continue;
 
-            // Извлечение дисперсий (диагональные элементы ковариационной матрицы)
             double sx = Math.Sqrt(Math.Max(0, invN[k, k]));
             double sy = Math.Sqrt(Math.Max(0, invN[k + 1, k + 1]));
             double sz = Math.Sqrt(Math.Max(0, invN[k + 2, k + 2]));
 
-            // Система координат Unity: X,Z — план, Y — высота
-            double sigmaPlan = Math.Sqrt(sx * sx + sz * sz); // план = X + Z
+            double sigmaPlan = Math.Sqrt(sx * sx + sz * sz);
             double sigma3D = Math.Sqrt(sx * sx + sy * sy + sz * sz);
 
             maxSigma = Math.Max(maxSigma, sigma3D);
@@ -2401,40 +2474,59 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             if (sigma3D * 1000.0 < 0.05)
                 almostZeroPrintedCount++;
 
-            Debug.Log(
-                $"Марка {grades[i].name}: " +
-                $"σX={sxText}, σY={syText}, σZ={szText}, " +
-                $"σплан={sigmaPlanText}, σ3D={sigma3DText}"
-            );
+            // ✅ Форматируем для консоли и UI
+            string consoleLine = $"Марка {grades[i].name}: σX={sxText}, σY={syText}, σZ={szText}, σплан={sigmaPlanText}, σ3D={sigma3DText}";
+            string uiLine = $"🔸 {grades[i].name}: σ3D={sigma3DText} (σплан={sigmaPlanText})";
+
+            Debug.Log(consoleLine);
+            AppendToNetworkReportUI(uiLine);
         }
 
         if (count > 0)
         {
+            string avgMsg = $"\n📈 Средняя σ3D: {FormatSigmaMm(sumSigma / count)}";
+            string maxMsg = $"📈 Максимальная σ3D: {FormatSigmaMm(maxSigma)}";
+
             Debug.Log($"\nСредняя σ3D: {FormatSigmaMm(sumSigma / count)}");
             Debug.Log($"Максимальная σ3D: {FormatSigmaMm(maxSigma)}");
 
+            AppendToNetworkReportUI(avgMsg);
+            AppendToNetworkReportUI(maxMsg);
+
             if (almostZeroPrintedCount == count)
             {
+                string smallMsg = "⚠️ Все σ3D очень малы (<0.05 мм): это относительная оценка при σ₀=1";
                 Debug.LogWarning("Все σ3D очень малы (<0.05 мм): это относительная оценка при σ₀=1 и текущих весах наблюдений, а не абсолютная апостериорная ошибка.");
+                AppendToNetworkReportUI(smallMsg);
             }
         }
 
-        // ===== 7. АНАЛИЗ ПОКРЫТИЯ =====
-        Debug.Log("\n=== АНАЛИЗ ПОКРЫТИЯ ===");
+        // ===== 7. ПОКРЫТИЕ =====
+        string coverageHeader = "\n=== 📡 АНАЛИЗ ПОКРЫТИЯ ===";
+        Debug.Log(coverageHeader);
+        AppendToNetworkReportUI(coverageHeader);
+
         var covered = new HashSet<Transform>();
         foreach (var st in selectedStations)
             if (st.visibleGrades != null)
                 covered.UnionWith(st.visibleGrades);
 
+        string coverageMsg = $"📡 Покрыто марок: {covered.Count}/{grades.Count}";
         Debug.Log($"Покрыто марок: {covered.Count}/{grades.Count}");
+        AppendToNetworkReportUI(coverageMsg);
 
         var uncovered = grades.Where(g => !covered.Contains(g)).ToList();
         if (uncovered.Count > 0)
+        {
+            string uncoveredMsg = $"⚠️ Непокрытые марки: {string.Join(", ", uncovered.Select(g => g.name))}";
             Debug.LogWarning("Непокрытые марки: " + string.Join(", ", uncovered.Select(g => g.name)));
+            AppendToNetworkReportUI(uncoveredMsg);
+        }
 
-        Debug.Log("\n=== ОТЧЁТ ЗАВЕРШЁН ===");
+        string endMsg = "\n=== ✅ ОТЧЁТ ЗАВЕРШЁН ===";
+        Debug.Log(endMsg);
+        AppendToNetworkReportUI(endMsg);
     }
-
     private string FormatSigmaMm(double sigmaMeters)
     {
         double mm = sigmaMeters * 1000.0;
