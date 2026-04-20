@@ -1932,6 +1932,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         // 6. Создаём объект
         Vector3 spawnFinal = spawn + Vector3.up * 0.02f;
         GameObject obj = Instantiate(networkPrefab, spawnFinal, Quaternion.identity, parentContainer);
+        SetIgnoreRaycastLayerRecursively(obj);
         station.networkObj = obj;
         station.ms60 = FindMS60Transform(obj);
         station.position = spawn;
@@ -1940,6 +1941,23 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
         Debug.Log($"✅ Станция размещена на позиции: {spawn}");
         return true;
+    }
+
+    private void SetIgnoreRaycastLayerRecursively(GameObject rootObj)
+    {
+        if (rootObj == null) return;
+
+        int ignoreRaycastLayer = LayerMask.NameToLayer("Ignore Raycast");
+        if (ignoreRaycastLayer < 0)
+        {
+            Debug.LogWarning("Слой 'Ignore Raycast' не найден. Слой станции не изменен.");
+            return;
+        }
+
+        foreach (Transform t in rootObj.GetComponentsInChildren<Transform>(true))
+        {
+            t.gameObject.layer = ignoreRaycastLayer;
+        }
     }
 
     // ДОПОЛНИТЕЛЬНЫЙ метод: проверка через физику с учетом всех объектов с тегом building
