@@ -57,22 +57,10 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     private List<Transform> grades = new List<Transform>();
     private Vector3 groundPos;
     private float alignmentPenalty;
-    private SphereCollider insideProbeCollider;
-    private const float InsideProbeRadius = 0.05f;
 
     private void Awake()
     {
         if (parentContainer == null) parentContainer = this.transform;
-        EnsureInsideProbeCollider();
-    }
-
-    private void OnDestroy()
-    {
-        if (insideProbeCollider != null)
-        {
-            Destroy(insideProbeCollider.gameObject);
-            insideProbeCollider = null;
-        }
     }
 
     private void Start()
@@ -1951,18 +1939,6 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         return true;
     }
 
-    private void EnsureInsideProbeCollider()
-    {
-        if (insideProbeCollider != null) return;
-
-        var probeObject = new GameObject("StationInsideProbeCollider");
-        probeObject.hideFlags = HideFlags.HideAndDontSave;
-        insideProbeCollider = probeObject.AddComponent<SphereCollider>();
-        insideProbeCollider.radius = InsideProbeRadius;
-        insideProbeCollider.isTrigger = true;
-        probeObject.transform.position = new Vector3(99999f, 99999f, 99999f);
-    }
-
     private static bool HasTagInHierarchy(Transform tr, string tag)
     {
         while (tr != null)
@@ -1974,88 +1950,55 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         return false;
     }
 
-    private bool IsMonitoredBuildingCollider(Collider col)
+    private static bool IsLayerInHierarchy(Transform tr, int layer)
     {
-        if (targetBuilding == null || col == null) return false;
-        Transform tr = col.transform;
         while (tr != null)
         {
-            if (tr.gameObject == targetBuilding)
+            if (tr.gameObject.layer == layer)
                 return true;
             tr = tr.parent;
         }
         return false;
     }
 
-    private bool IsBlockingCollider(Collider col, int interactLayer)
-    {
-        if (col == null || col.isTrigger) return false;
-
-        bool isBuildingTag = HasTagInHierarchy(col.transform, "building");
-        bool isMonitoredBuilding = IsMonitoredBuildingCollider(col);
-        bool isInteractLayer = interactLayer >= 0 && col.gameObject.layer == interactLayer;
-        return isBuildingTag || isMonitoredBuilding || isInteractLayer;
-    }
-
-    private bool IsPointInsideCollider(Collider target, Vector3 pos)
-    {
-        if (target == null) return false;
-        EnsureInsideProbeCollider();
-
-        if (insideProbeCollider != null)
-        {
-            bool penetrates = Physics.ComputePenetration(
-                insideProbeCollider, pos, Quaternion.identity,
-                target, target.transform.position, target.transform.rotation,
-                out _, out float distance);
-
-            if (penetrates && distance > 0.0001f)
-                return true;
-        }
-
-        // Fallback: для некоторых нестандартных коллайдеров.
-        Vector3 closest = target.ClosestPoint(pos);
-        return (closest - pos).sqrMagnitude <= 0.0004f; // ~2 см
-    }
-
-    // Проверка: позиция внутри мониторимого здания, любых других зданий или объектов слоя Interact.
+    // Проверка: позиция внутри здания или объекта на слое Interact.
     private bool IsInsideAnyBuilding(Vector3 pos)
     {
         int interactLayer = LayerMask.NameToLayer("Interact");
-
-        // 1) Жёсткая проверка мониторимого здания (включая все дочерние коллайдеры).
-        if (targetBuilding != null)
-        {
-            var monitoredColliders = targetBuilding.GetComponentsInChildren<Collider>(true);
-            foreach (var col in monitoredColliders)
-            {
-                if (col == null || col.isTrigger) continue;
-                if (IsPointInsideCollider(col, pos))
-                    return true;
-            }
-        }
-
-        // 2) Проверка окружающих коллайдеров: все здания и объекты слоя Interact.
-        float checkRadius = 0.75f;
+        float checkRadius = 0.35f;
         Collider[] colliders = Physics.OverlapSphere(pos, checkRadius, ~0, QueryTriggerInteraction.Ignore);
 
         foreach (Collider col in colliders)
         {
-            if (!IsBlockingCollider(col, interactLayer))
+            if (col == null || col.isTrigger)
                 continue;
 
-            if (IsPointInsideCollider(col, pos))
+            bool isBuilding = HasTagInHierarchy(col.transform, "building");
+            bool isInteract = interactLayer >= 0 && IsLayerInHierarchy(col.transform, interactLayer);
+
+            if (!isBuilding && !isInteract)
+                continue;
+
+            // Для внутренней точки ClosestPoint вернет саму точку.
+            Vector3 closestPoint = col.ClosestPoint(pos);
+            if ((closestPoint - pos).sqrMagnitude < 0.0025f) // 5 см допуск
                 return true;
         }
 
-        // 3) Fallback для сложной геометрии мешей: паритет пересечений по вертикали.
+        // Fallback для сложных мешей.
         Ray ray = new Ray(pos + Vector3.down * 100f, Vector3.up);
         RaycastHit[] hits = Physics.RaycastAll(ray, 200f, ~0, QueryTriggerInteraction.Ignore);
 
         int targetHitCount = 0;
         foreach (RaycastHit hit in hits)
         {
-            if (IsBlockingCollider(hit.collider, interactLayer))
+            if (hit.collider == null || hit.collider.isTrigger)
+                continue;
+
+            bool isBuilding = HasTagInHierarchy(hit.collider.transform, "building");
+            bool isInteract = interactLayer >= 0 && IsLayerInHierarchy(hit.collider.transform, interactLayer);
+
+            if (isBuilding || isInteract)
                 targetHitCount++;
         }
 
