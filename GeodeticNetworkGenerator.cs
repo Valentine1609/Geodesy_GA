@@ -23,6 +23,9 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     public float raycastHeight = 5f;
     public LayerMask groundLayer;
     public LayerMask obstacleLayer;
+    [Header("Ограничения размещения")]
+    public LayerMask interactLayer;
+    [Range(10f, 85f)] public float maxGradeViewDeviationDeg = 70f;
     [Header("Ограничения количества станций")]
     public int minStations = 3;
     [Header("py файл (указываем через Inspector)")]
@@ -1943,14 +1946,21 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     // Замените метод IsInsideAnyBuilding на этот:
     private bool IsInsideAnyBuilding(Vector3 pos)
     {
-        // Быстрая проверка через OverlapSphere
+        // Быстрая проверка через OverlapSphere: здания + запрещенные interact-коллайдеры.
         float checkRadius = 0.5f;
-        Collider[] colliders = Physics.OverlapSphere(pos, checkRadius);
+        Collider[] colliders = Physics.OverlapSphere(pos, checkRadius, ~0, QueryTriggerInteraction.Ignore);
 
         foreach (Collider col in colliders)
         {
             // Проверяем все объекты с тегом building
             if (col.CompareTag("building"))
+            {
+                return true;
+            }
+
+            // Дополнительно запрещаем размещение внутри объектов слоя interact
+            int layerMaskBit = 1 << col.gameObject.layer;
+            if ((interactLayer.value & layerMaskBit) != 0)
             {
                 return true;
             }
@@ -1972,6 +1982,25 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         }
 
         return buildingHitCount % 2 == 1; // Нечетное число попаданий = внутри здания
+    }
+
+    // Марка ориентирована синей стрелкой в сторону стены (grade.forward -> внутрь фасада),
+    // поэтому наблюдение должно идти примерно со стороны -grade.forward.
+    private bool IsGradeFacingStation(Transform grade, Vector3 stationPos)
+    {
+        if (grade == null) return false;
+
+        Vector3 outwardNormal = -grade.forward;
+        Vector3 toStation = stationPos - grade.position;
+
+        // Горизонтальная составляющая: не допускаем почти вертикальные лучи.
+        outwardNormal.y = 0f;
+        toStation.y = 0f;
+        if (outwardNormal.sqrMagnitude < 1e-4f || toStation.sqrMagnitude < 1e-4f)
+            return false;
+
+        float deviation = Vector3.Angle(outwardNormal.normalized, toStation.normalized);
+        return deviation <= maxGradeViewDeviationDeg;
     }
 
 
@@ -2046,6 +2075,11 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             if (horizontalDist > 0 && verticalDiff / horizontalDist > Mathf.Tan(60f * Mathf.Deg2Rad))
                 continue;
 
+            // Отсекаем острые (скользящие вдоль стены) направления на марку:
+            // марка должна "смотреть" наружу в сторону станции.
+            if (!IsGradeFacingStation(g, pos))
+                continue;
+
             if (HasLineOfSight(from, to))
             {
                 visible.Add(g);
@@ -2093,6 +2127,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     private bool CheckLineOfSightToGrade(Transform ms60, Transform grade)
     {
         if (ms60 == null || grade == null) return false;
+        if (!IsGradeFacingStation(grade, ms60.position)) return false;
 
         // Используем ту же высоту, что и в GetVisibleGradesFromPos
         Vector3 fromEyePos = ms60.position + Vector3.up * 1.7f;
