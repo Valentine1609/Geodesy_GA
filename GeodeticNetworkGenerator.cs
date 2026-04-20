@@ -24,7 +24,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     public LayerMask groundLayer;
     public LayerMask obstacleLayer;
     [Header("Ограничение угла к марке")]
-    [Range(5f, 80f)] public float perpendicularToGradeTolerance = 35f; // допуск к перпендикуляру к плоскости марки
+    [Range(2f, 80f)] public float perpendicularToGradeTolerance = 20f; // допуск к направлению на марку вдоль синей оси марки
     [Header("Ограничения количества станций")]
     public int minStations = 3;
     [Header("py файл (указываем через Inspector)")]
@@ -1456,6 +1456,13 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             if (station.visibleGrades == null || station.visibleGrades.Count == 0)
                 return DEAD_PENALTY;
 
+            // Жёсткая валидация: если в видимых осталась марка с недопустимым углом — отбраковываем.
+            foreach (var grade in station.visibleGrades)
+            {
+                if (!IsNearPerpendicularToGrade(station.position + Vector3.up * 1.7f, grade))
+                    return DEAD_PENALTY;
+            }
+
             coveredGrades.UnionWith(station.visibleGrades);
 
             foreach (var grade in station.visibleGrades)
@@ -2101,20 +2108,17 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         if (gradeNormal.sqrMagnitude < 0.0001f)
             return true;
 
-        // Используем горизонтальную проекцию, чтобы не ломать проверку из‑за высотной разницы.
-        gradeNormal.y = 0f;
-        Vector3 gradeToStation = stationPos - grade.position;
-        gradeToStation.y = 0f;
-
-        if (gradeNormal.sqrMagnitude < 0.0001f || gradeToStation.sqrMagnitude < 0.0001f)
+        Vector3 stationToGrade = grade.position - stationPos;
+        if (stationToGrade.sqrMagnitude < 0.0001f)
             return true;
 
         gradeNormal.Normalize();
-        gradeToStation.Normalize();
+        stationToGrade.Normalize();
 
-        // Станция перед маркой: вектор grade->station должен быть направлен примерно ПРОТИВ синей оси.
-        float angleToOppositeForward = Vector3.Angle(gradeToStation, -gradeNormal);
-        return angleToOppositeForward <= perpendicularToGradeTolerance;
+        // Если синяя ось марки смотрит в сторону здания, то station->grade должен быть направлен
+        // примерно вдоль grade.forward (перпендикуляр к плоскости марки).
+        float angleToForward = Vector3.Angle(stationToGrade, gradeNormal);
+        return angleToForward <= perpendicularToGradeTolerance;
     }
     private void DebugStationCoverage(List<Station> solution)
     {
