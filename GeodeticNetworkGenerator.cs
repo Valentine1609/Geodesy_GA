@@ -1939,39 +1939,55 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         return true;
     }
 
-    // ДОПОЛНИТЕЛЬНЫЙ метод: проверка через физику с учетом всех объектов с тегом building
-    // Замените метод IsInsideAnyBuilding на этот:
+    // Проверка: позиция находится внутри здания или любого объекта на слое Interact.
     private bool IsInsideAnyBuilding(Vector3 pos)
     {
-        // Быстрая проверка через OverlapSphere
+        int interactLayer = LayerMask.NameToLayer("Interact");
+
+        // Быстрая проверка через OverlapSphere: tag=building ИЛИ layer=Interact.
         float checkRadius = 0.5f;
-        Collider[] colliders = Physics.OverlapSphere(pos, checkRadius);
+        Collider[] colliders = Physics.OverlapSphere(pos, checkRadius, ~0, QueryTriggerInteraction.Ignore);
 
         foreach (Collider col in colliders)
         {
-            // Проверяем все объекты с тегом building
-            if (col.CompareTag("building"))
+            bool isBuilding = col.CompareTag("building") ||
+                              (col.transform.parent != null && col.transform.parent.CompareTag("building"));
+            bool isInteract = interactLayer >= 0 && col.gameObject.layer == interactLayer;
+
+            if (!isBuilding && !isInteract)
+                continue;
+
+            // OverlapSphere может задевать внешний контур, поэтому дополнительно проверяем,
+            // что точка действительно внутри коллайдера.
+            Vector3 closestPoint = col.ClosestPoint(pos);
+            if ((closestPoint - pos).sqrMagnitude < 0.0001f)
             {
                 return true;
             }
         }
 
-        // Дополнительная проверка через raycast вверх
-        // Если луч пересекает здание нечетное число раз - точка внутри
+        // Дополнительная проверка через raycast вверх для сложных мешей:
+        // если число пересечений с целевыми коллайдерами нечётное, точка внутри.
         Ray ray = new Ray(pos + Vector3.down * 100f, Vector3.up);
-        RaycastHit[] hits = Physics.RaycastAll(ray, 200f);
+        RaycastHit[] hits = Physics.RaycastAll(ray, 200f, ~0, QueryTriggerInteraction.Ignore);
 
-        int buildingHitCount = 0;
+        int targetHitCount = 0;
         foreach (RaycastHit hit in hits)
         {
-            if (hit.collider.CompareTag("building") ||
-                (hit.collider.transform.parent != null && hit.collider.transform.parent.CompareTag("building")))
+            if (hit.collider == null)
+                continue;
+
+            bool isBuilding = hit.collider.CompareTag("building") ||
+                              (hit.collider.transform.parent != null && hit.collider.transform.parent.CompareTag("building"));
+            bool isInteract = interactLayer >= 0 && hit.collider.gameObject.layer == interactLayer;
+
+            if (isBuilding || isInteract)
             {
-                buildingHitCount++;
+                targetHitCount++;
             }
         }
 
-        return buildingHitCount % 2 == 1; // Нечетное число попаданий = внутри здания
+        return targetHitCount % 2 == 1;
     }
 
 
