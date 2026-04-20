@@ -23,6 +23,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     public float raycastHeight = 5f;
     public LayerMask groundLayer;
     public LayerMask obstacleLayer;
+    [Header("Ограничение угла к марке")]
+    [Range(5f, 80f)] public float perpendicularToGradeTolerance = 35f; // допуск к перпендикуляру к плоскости марки
     [Header("Ограничения количества станций")]
     public int minStations = 3;
     [Header("py файл (указываем через Inspector)")]
@@ -2077,6 +2079,11 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             if (horizontalDist > 0 && verticalDiff / horizontalDist > Mathf.Tan(60f * Mathf.Deg2Rad))
                 continue;
 
+            // Требование: направление на марку должно быть близко к перпендикуляру к плоскости марки
+            // (по локальной синей оси марки).
+            if (!IsNearPerpendicularToGrade(from, g))
+                continue;
+
             if (HasLineOfSight(from, to))
             {
                 visible.Add(g);
@@ -2084,6 +2091,30 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         }
 
         return visible;
+    }
+
+    private bool IsNearPerpendicularToGrade(Vector3 stationPos, Transform grade)
+    {
+        if (grade == null) return false;
+
+        Vector3 gradeNormal = grade.forward;
+        if (gradeNormal.sqrMagnitude < 0.0001f)
+            return true;
+
+        // Используем горизонтальную проекцию, чтобы не ломать проверку из‑за высотной разницы.
+        gradeNormal.y = 0f;
+        Vector3 gradeToStation = stationPos - grade.position;
+        gradeToStation.y = 0f;
+
+        if (gradeNormal.sqrMagnitude < 0.0001f || gradeToStation.sqrMagnitude < 0.0001f)
+            return true;
+
+        gradeNormal.Normalize();
+        gradeToStation.Normalize();
+
+        // Станция перед маркой: вектор grade->station должен быть направлен примерно ПРОТИВ синей оси.
+        float angleToOppositeForward = Vector3.Angle(gradeToStation, -gradeNormal);
+        return angleToOppositeForward <= perpendicularToGradeTolerance;
     }
     private void DebugStationCoverage(List<Station> solution)
     {
@@ -2128,6 +2159,10 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         // Используем ту же высоту, что и в GetVisibleGradesFromPos
         Vector3 fromEyePos = ms60.position + Vector3.up * 1.7f;
         Vector3 toTargetPos = grade.position + Vector3.up * 0.5f;
+
+        // Единое ограничение по перпендикулярности к марке.
+        if (!IsNearPerpendicularToGrade(fromEyePos, grade))
+            return false;
 
         // Дополнительная проверка: линия должна быть выше минимальной высоты
         float minHeightAboveGround = 0.5f; // Минимум 0.5м над землей
