@@ -25,6 +25,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     public LayerMask obstacleLayer;
     [Header("Ограничения количества станций")]
     public int minStations = 3;
+    public int maxStations = 6;
     [Header("py файл (указываем через Inspector)")]
     [Header("СКО")]
     public TMP_InputField directionStdevInput;
@@ -132,6 +133,16 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         EvaluateNetworkStability(topK: 5);
     }
 
+    private int GetTargetMaxStations()
+    {
+        int gradeBasedCap = grades != null && grades.Count > 0
+            ? Mathf.CeilToInt(grades.Count / 3f)
+            : maxStations;
+
+        int hardCap = Mathf.Max(minStations, maxStations);
+        return Mathf.Clamp(gradeBasedCap, minStations, hardCap);
+    }
+
     public void OnGenerateButtonPressed()
     {
         GenerateNetwork();
@@ -197,6 +208,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         List<Station> bestSolution = RunGeneticAlgorithm();
 
         // Применяем найденное решение
+        bestSolution = PruneRedundantStations(bestSolution);
+
         foreach (var station in bestSolution)
         {
             TryPlaceStation(station, targetBuilding.GetComponent<Collider>());
@@ -361,11 +374,11 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                         }
 
                         // РАННИЙ ВЫХОД если нашли хорошее компактное решение
-                        if (bestSolution.Count <= 8 && fitness > 1000000f)
+                        if (bestSolution.Count <= GetTargetMaxStations() && fitness > 1000000f)
                         {
                             Debug.Log($"🎯 Ранний выход: найдено оптимальное решение на поколении {generation}");
                             stopwatch.Stop();
-                            return RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider);
+                            return PruneRedundantStations(RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider));
                         }
                     }
                 }
@@ -639,17 +652,17 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                     float fallbackFitness = CalculateFitness(fallback, bounds, buildingCollider);
 
                     var candidateBest = fallbackFitness > bestFitnessVal ? fallback : bestSolution;
-                    return RefineSolutionForRedundancyAndAngles(candidateBest, candidatePositions, bounds, buildingCollider);
+                    return PruneRedundantStations(RefineSolutionForRedundancyAndAngles(candidateBest, candidatePositions, bounds, buildingCollider));
                 }
             }
 
-            return RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider);
+            return PruneRedundantStations(RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider));
         }
         else
         {
             Debug.LogWarning("ГА не нашел решения, используем fallback");
             var fallback = GenerateFallbackSolution(bounds, buildingCollider, baseOffset);
-            return RefineSolutionForRedundancyAndAngles(fallback, candidatePositions, bounds, buildingCollider);
+            return PruneRedundantStations(RefineSolutionForRedundancyAndAngles(fallback, candidatePositions, bounds, buildingCollider));
         }
     }
 
@@ -674,10 +687,10 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         if (candidatePositions == null || candidatePositions.Count == 0)
             return refined;
 
-        const int maxExtraStations = 4;
+        int maxExtraStations = Mathf.Max(0, GetTargetMaxStations() - refined.Count);
         const float minSpacing = 6f;
 
-        for (int step = 0; step < maxExtraStations; step++)
+        for (int step = 0; step < maxExtraStations && refined.Count < GetTargetMaxStations(); step++)
         {
             foreach (var st in refined)
                 st.visibleGrades = GetVisibleGradesFromPos(st.position);
@@ -930,7 +943,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         }
 
         // Жадное добавление станций, пока не покроем все марки или не достигнем максимума
-        while (uncoveredGrades.Count > 0 && solution.Count < 12 && availableCandidates.Count > 0)
+        while (uncoveredGrades.Count > 0 && solution.Count < GetTargetMaxStations() && availableCandidates.Count > 0)
         {
             // Перемешиваем кандидатов для разнообразия
             availableCandidates = availableCandidates.OrderBy(x => UnityEngine.Random.value).ToList();
@@ -978,7 +991,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         // Случайное количество станций (3-8, но не больше доступных кандидатов)
         int stationCount = UnityEngine.Random.Range(
             Mathf.Max(minStations, 3),
-            Mathf.Min(8, candidatePositions.Count) + 1
+            Mathf.Min(GetTargetMaxStations(), candidatePositions.Count) + 1
         );
 
         var shuffled = candidatePositions.OrderBy(x => UnityEngine.Random.value).ToList();
@@ -1033,7 +1046,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         int sectors = 4 + (seed % 3); // 4-6 секторов
         float angleStep = 360f / sectors;
 
-        for (int sector = 0; sector < sectors && solution.Count < 8; sector++)
+        for (int sector = 0; sector < sectors && solution.Count < GetTargetMaxStations(); sector++)
         {
             float baseAngle = sector * angleStep + UnityEngine.Random.Range(-15f, 15f);
 
@@ -1486,16 +1499,16 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         float fitness = 100000f;
 
         // ================== 6. МИНИМИЗАЦИЯ КОЛИЧЕСТВА СТАНЦИЙ ==================
-        int optimalCount = Mathf.Max(minStations, Mathf.CeilToInt(grades.Count / 2.0f));
+        int optimalCount = GetTargetMaxStations();
 
         if (solution.Count > optimalCount)
         {
             int excessStations = solution.Count - optimalCount;
-            fitness -= excessStations * 30000f;
+            fitness -= excessStations * 80000f;
         }
-        else if (solution.Count < optimalCount)
+        else
         {
-            fitness += (optimalCount - solution.Count) * 10000f;
+            fitness += (optimalCount - solution.Count) * 5000f;
         }
 
         // ================== 7. ПРОВЕРКА УГЛОВ НАБЛЮДЕНИЯ (3D) ==================
@@ -1696,10 +1709,10 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         }
 
         // УДАЛИТЬ лишние станции если их слишком много (но оставить минимум)
-        if (child.Count > 10)
+        if (child.Count > GetTargetMaxStations())
         {
             child = child.OrderByDescending(s => s.visibleGrades.Count)
-                        .Take(10)
+                        .Take(GetTargetMaxStations())
                         .ToList();
         }
 
@@ -1773,7 +1786,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         }
 
         // ТРЕТЬЯ МУТАЦИЯ: с вероятностью 15% добавляем новую станцию
-        if (UnityEngine.Random.value < 0.15f && mutated.Count < 12)
+        if (UnityEngine.Random.value < 0.15f && mutated.Count < GetTargetMaxStations())
         {
             var candidates = GenerateCandidatePositions(bounds, buildingCollider, baseOffset);
             if (candidates.Count > 0)
@@ -1839,7 +1852,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             candidatePositions.Remove(bestPos);
 
             // ✅ Увеличена защита от бесконечного цикла
-            if (solution.Count > 20) break;
+            if (solution.Count > Mathf.Max(GetTargetMaxStations() + 4, 12)) break;
         }
 
         if (uncoveredGrades.Count == 0)
@@ -1853,6 +1866,63 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         }
 
         return solution;
+    }
+
+    private List<Station> PruneRedundantStations(List<Station> solution)
+    {
+        if (solution == null || solution.Count == 0)
+            return new List<Station>();
+
+        var working = solution
+            .Where(s => s != null)
+            .Select(s => new Station
+            {
+                position = s.position,
+                visibleGrades = GetVisibleGradesFromPos(s.position)
+            })
+            .Where(s => s.visibleGrades != null && s.visibleGrades.Count > 0)
+            .OrderByDescending(s => s.visibleGrades.Count)
+            .ToList();
+
+        int targetCap = GetTargetMaxStations();
+        if (working.Count <= targetCap)
+            return working;
+
+        while (working.Count > targetCap)
+        {
+            int removeIndex = -1;
+            int bestLoss = int.MaxValue;
+
+            for (int i = 0; i < working.Count; i++)
+            {
+                var remaining = working.Where((_, idx) => idx != i).ToList();
+                var covered = new HashSet<Transform>();
+                foreach (var st in remaining)
+                    covered.UnionWith(st.visibleGrades);
+
+                int loss = grades.Count - covered.Count;
+                if (loss < bestLoss)
+                {
+                    bestLoss = loss;
+                    removeIndex = i;
+                }
+            }
+
+            if (removeIndex < 0)
+                break;
+
+            var tentative = working.Where((_, idx) => idx != removeIndex).ToList();
+            var coveredTentative = new HashSet<Transform>();
+            foreach (var st in tentative)
+                coveredTentative.UnionWith(st.visibleGrades);
+
+            if (coveredTentative.Count >= Mathf.CeilToInt(grades.Count * 0.95f) && tentative.Count >= minStations)
+                working = tentative;
+            else
+                break;
+        }
+
+        return working;
     }
 
     // Размещение станции
@@ -1975,12 +2045,20 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     }
 
 
+    private bool IsSameOrChild(Transform candidate, Transform root)
+    {
+        if (candidate == null || root == null)
+            return false;
+
+        return candidate == root || candidate.IsChildOf(root);
+    }
+
     // Проверка прямой видимости между точками
-    private bool HasLineOfSight(Vector3 fromPos, Vector3 toPos)
+    private bool HasLineOfSight(Vector3 fromPos, Vector3 toPos, Transform target = null)
     {
         float maxDistance = 100f;
-        float startTolerance = 0.2f;
-        float endTolerance = 0.35f;
+        float startTolerance = 0.15f;
+        float endTolerance = 0.08f;
 
         Vector3 dir = toPos - fromPos;
         float dist = dir.magnitude;
@@ -1996,11 +2074,12 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
         // Важный нюанс: SphereCast может ложноположительно цеплять фасад рядом с маркой,
         // поэтому используем обычный RaycastAll и вручную фильтруем попадания у старта/финиша.
+        int losMask = Physics.DefaultRaycastLayers & ~groundLayer.value;
         RaycastHit[] hits = Physics.RaycastAll(
             fromAdjusted,
             dir.normalized,
             dist,
-            obstacleLayer,
+            losMask,
             QueryTriggerInteraction.Ignore);
 
         foreach (RaycastHit hit in hits)
@@ -2014,6 +2093,12 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 continue;
 
             if (dist - hit.distance <= endTolerance)
+                continue;
+
+            if (target != null && IsSameOrChild(hit.collider.transform, target))
+                continue;
+
+            if (hit.collider.CompareTag("grade") || hit.collider.CompareTag("network"))
                 continue;
 
             return false;
@@ -2046,7 +2131,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             if (horizontalDist > 0 && verticalDiff / horizontalDist > Mathf.Tan(60f * Mathf.Deg2Rad))
                 continue;
 
-            if (HasLineOfSight(from, to))
+            if (HasLineOfSight(from, to, g))
             {
                 visible.Add(g);
             }
