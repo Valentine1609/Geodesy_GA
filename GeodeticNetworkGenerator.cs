@@ -42,7 +42,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     public float condScale = 1000f;         // масштаб для нормализации цвета
     [Header("Ограничения углов наблюдения")]
     public float minIntersectionAngleDeg = 60f;   // минимальный угол пересечения лучей у марки
-    public float maxGradeApproachAngleDeg = 65f;  // максимум отклонения от -grade.forward
+    public float targetPerpendicularToBlueDeg = 90f; // целевой угол к синей оси марки (local Z)
+    public float perpendicularToleranceDeg = 30f;    // допустимое отклонение от целевого угла
     private List<(Vector3 pos, double cond)> lastSuggestions;  // сохраняем последние кандидаты
 
 
@@ -2095,11 +2096,11 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
 
     // Проверка прямой видимости между точками
-    private bool HasLineOfSight(Vector3 fromPos, Vector3 toPos)
+    private bool HasLineOfSight(Vector3 fromPos, Vector3 toPos, Transform fromTransform = null, Transform toTransform = null)
     {
         float maxDistance = 100f;
         float startTolerance = 0.2f;
-        float endTolerance = 0.35f;
+        float endTolerance = 0.08f;
 
         Vector3 dir = toPos - fromPos;
         float dist = dir.magnitude;
@@ -2121,6 +2122,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             dist,
             ~0,
             QueryTriggerInteraction.Ignore);
+        Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
 
         foreach (RaycastHit hit in hits)
         {
@@ -2132,15 +2134,19 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             if (hit.distance <= startTolerance)
                 continue;
 
-            if (dist - hit.distance <= endTolerance)
-                continue;
-
             bool isBuilding =
                 hit.collider.CompareTag("building") ||
                 (hit.collider.transform.parent != null && hit.collider.transform.parent.CompareTag("building"));
 
             bool isInObstacleMask = ((obstacleLayer.value & (1 << hit.collider.gameObject.layer)) != 0);
-            if (!isBuilding && !isInObstacleMask)
+            bool isMeshCollider = hit.collider is MeshCollider;
+            if (!isBuilding && !isInObstacleMask && !isMeshCollider)
+                continue;
+
+            bool sameAsFrom = fromTransform != null && (hit.collider.transform == fromTransform || hit.collider.transform.IsChildOf(fromTransform));
+            bool sameAsTo = toTransform != null && (hit.collider.transform == toTransform || hit.collider.transform.IsChildOf(toTransform));
+
+            if ((sameAsFrom || sameAsTo) && (dist - hit.distance <= endTolerance))
                 continue;
 
             return false;
@@ -2157,13 +2163,14 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             return false;
 
         Vector3 gradeToStation = (stationPos - grade.position).normalized;
-        Vector3 desiredDirection = -grade.forward.normalized;
+        Vector3 blueAxis = grade.forward.normalized;
 
-        if (desiredDirection.sqrMagnitude < 0.001f)
+        if (blueAxis.sqrMagnitude < 0.001f)
             return true;
 
-        float approachAngle = Vector3.Angle(gradeToStation, desiredDirection);
-        return approachAngle <= maxGradeApproachAngleDeg;
+        float approachAngle = Vector3.Angle(gradeToStation, blueAxis);
+        float deltaToTarget = Mathf.Abs(approachAngle - targetPerpendicularToBlueDeg);
+        return deltaToTarget <= perpendicularToleranceDeg;
     }
 
 
@@ -2193,7 +2200,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             if (!IsValidApproachToGrade(pos, g))
                 continue;
 
-            if (HasLineOfSight(from, to))
+            if (HasLineOfSight(from, to, null, g))
             {
                 visible.Add(g);
             }
@@ -2268,7 +2275,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             }
         }
 
-        return HasLineOfSight(fromEyePos, toTargetPos);
+        return HasLineOfSight(fromEyePos, toTargetPos, ms60, grade);
     }
 
     // Построение линии
