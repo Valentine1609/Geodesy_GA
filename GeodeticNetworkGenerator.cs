@@ -40,6 +40,15 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     public bool showWeakLinks = true;       // показывать слабые позиции
     public float gizmoSphereSize = 0.3f;    // размер сфер для кандидатов
     public float condScale = 1000f;         // масштаб для нормализации цвета
+    [Header("Геометрия наблюдений")]
+    [Tooltip("Минимальный угол засечки по марке между станциями. Меньше = острые углы.")]
+    public float minIntersectionAngleDeg = 45f;
+    [Tooltip("Допустимый угол падения луча относительно нормали марки.")]
+    public float maxIncidenceAngleDeg = 75f;
+    [Tooltip("Минимальное расстояние станции до ближайшей марки (для большего охвата).")]
+    public float minStationToGradeDistance = 8f;
+    [Tooltip("Целевое расстояние станции до марок (максимизирует общий охват).")]
+    public float preferredStationToGradeDistance = 18f;
     private List<(Vector3 pos, double cond)> lastSuggestions;  // сохраняем последние кандидаты
 
 
@@ -1217,7 +1226,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                         Vector3 wallPoint = buildingCollider != null ? buildingCollider.ClosestPoint(groundPos) : groundPos;
                         if (Vector3.Distance(groundPos, wallPoint) > 1.5f)
                         {
-                            candidates.Add(groundPos);
+                            if (IsCandidateDistanceValid(groundPos))
+                                candidates.Add(groundPos);
                         }
                     }
                 }
@@ -1256,7 +1266,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
                             if (!IsInsideAnyBuilding(groundPos))
                             {
-                                candidates.Add(groundPos);
+                                if (IsCandidateDistanceValid(groundPos))
+                                    candidates.Add(groundPos);
                             }
                         }
                     }
@@ -1290,7 +1301,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
                     if (!IsInsideAnyBuilding(groundPos))
                     {
-                        candidates.Add(groundPos);
+                        if (IsCandidateDistanceValid(groundPos))
+                            candidates.Add(groundPos);
                     }
                 }
             }
@@ -1353,6 +1365,29 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         return (minDistance + maxDistance) * 0.5f;
     }
 
+    private bool IsCandidateDistanceValid(Vector3 candidatePos)
+    {
+        if (grades == null || grades.Count == 0)
+            return true;
+
+        float nearest = float.MaxValue;
+        foreach (var grade in grades)
+        {
+            if (grade == null) continue;
+            float d = Vector3.Distance(candidatePos, grade.position);
+            if (d < nearest) nearest = d;
+        }
+
+        if (nearest < minStationToGradeDistance)
+            return false;
+
+        // Слишком дальние точки почти не дают охвата; оставляем мягкий потолок.
+        if (nearest > preferredStationToGradeDistance * 2.2f)
+            return false;
+
+        return true;
+    }
+
     private int CountMarksWithAtLeastTwoObservers(List<Station> solution)
     {
         if (solution == null || grades == null || grades.Count == 0)
@@ -1375,10 +1410,12 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         return counts.Values.Count(v => v >= 2);
     }
 
-    private int CountMarksWithAcuteAngles(List<Station> solution, float acuteThresholdDeg = 45f)
+    private int CountMarksWithAcuteAngles(List<Station> solution, float acuteThresholdDeg = -1f)
     {
         if (solution == null || grades == null || grades.Count == 0)
             return 0;
+        if (acuteThresholdDeg <= 0f)
+            acuteThresholdDeg = minIntersectionAngleDeg;
 
         int acuteMarks = 0;
         foreach (var grade in grades)
@@ -1448,6 +1485,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             gradeObservationCount[grade] = 0;
         }
 
+        float stationCoverageReward = 0f;
         foreach (var station in solution)
         {
             station.visibleGrades = GetVisibleGradesFromPos(station.position);
@@ -1461,6 +1499,9 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 if (gradeObservationCount.ContainsKey(grade))
                     gradeObservationCount[grade]++;
             }
+
+            // Станция должна брать много марок.
+            stationCoverageReward += station.visibleGrades.Count * 350f;
         }
 
         // ================== 4. ПРОВЕРКА РЕДУНДАНТНОСТИ (минимум 2 наблюдения на марку) ==================
@@ -1484,6 +1525,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
         // ================== 5. ГЛАВНЫЙ ФИТНЕС: ПОЛНОЕ ПОКРЫТИЕ + РЕДУНДАНТНОСТЬ ==================
         float fitness = 100000f;
+        fitness += stationCoverageReward;
 
         // ================== 6. МИНИМИЗАЦИЯ КОЛИЧЕСТВА СТАНЦИЙ ==================
         int optimalCount = Mathf.Max(minStations, Mathf.CeilToInt(grades.Count / 2.0f));
@@ -1498,9 +1540,10 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             fitness += (optimalCount - solution.Count) * 10000f;
         }
 
-        // ================== 7. ПРОВЕРКА УГЛОВ НАБЛЮДЕНИЯ (3D) ==================
+        // ================== 7. ПРОВЕРКА УГЛОВ НАБЛЮДЕНИЯ (3D) + угол падения ==================
         int marksWithGoodAngles = 0;
         float totalMinAngle = 0f;
+        float incidencePenalty = 0f;
 
         foreach (var grade in grades)
         {
@@ -1533,7 +1576,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                         hasGoodAngle = true;
                         fitness += 2500f;
                     }
-                    else if (angle < 45f || angle > 135f)
+                    else if (angle < minIntersectionAngleDeg || angle > (180f - minIntersectionAngleDeg))
                     {
                         // Избегаем острых/почти коллинеарных конфигураций
                         fitness -= 8000f;
@@ -1543,13 +1586,39 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
             totalMinAngle += minAngle;
             if (hasGoodAngle) marksWithGoodAngles++;
+
+            foreach (var station in solution.Where(s => s.visibleGrades.Contains(grade)))
+            {
+                float incidence = GetIncidenceAngleDeg(station.position + Vector3.up * 1.7f, grade);
+                if (incidence > maxIncidenceAngleDeg)
+                    incidencePenalty += (incidence - maxIncidenceAngleDeg) * 250f;
+                else
+                    fitness += (maxIncidenceAngleDeg - incidence) * 25f;
+            }
         }
 
         if (grades.Count > 0)
         {
             float avgMinAngle = totalMinAngle / grades.Count;
             if (avgMinAngle >= 70f) fitness += 15000f;
-            else if (avgMinAngle < 45f) fitness -= 20000f;
+            else if (avgMinAngle < minIntersectionAngleDeg) fitness -= 20000f;
+        }
+        fitness -= incidencePenalty;
+
+        // ================== 7.1 БАЛАНС ДИСТАНЦИИ ДО МАРОК ==================
+        foreach (var station in solution)
+        {
+            if (station.visibleGrades == null || station.visibleGrades.Count == 0)
+                continue;
+
+            float avgDistToVisibleGrades = station.visibleGrades
+                .Average(g => Vector3.Distance(station.position, g.position));
+
+            float distDelta = Mathf.Abs(avgDistToVisibleGrades - preferredStationToGradeDistance);
+            fitness -= distDelta * 220f;
+
+            if (avgDistToVisibleGrades < minStationToGradeDistance)
+                fitness -= (minStationToGradeDistance - avgDistToVisibleGrades) * 2000f;
         }
 
         // ================== 8. РАСПРЕДЕЛЕНИЕ ПО КВАДРАНТАМ ==================
@@ -1975,8 +2044,9 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     }
 
 
-    // Проверка прямой видимости между точками
-    private bool HasLineOfSight(Vector3 fromPos, Vector3 toPos)
+    // Проверка прямой видимости между точками.
+    // ВАЖНО: учитываем блокировку ЛЮБЫМ collider, а не только obstacleLayer.
+    private bool HasLineOfSight(Vector3 fromPos, Vector3 toPos, Transform targetGrade = null)
     {
         float maxDistance = 100f;
         float startTolerance = 0.2f;
@@ -2000,12 +2070,15 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             fromAdjusted,
             dir.normalized,
             dist,
-            obstacleLayer,
+            ~0,
             QueryTriggerInteraction.Ignore);
 
         foreach (RaycastHit hit in hits)
         {
             if (hit.collider == null)
+                continue;
+
+            if (IsIgnorableOccluder(hit.collider, targetGrade))
                 continue;
 
             // Игнорируем попадания слишком близко к станции или к самой цели.
@@ -2020,6 +2093,22 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         }
 
         return true;
+    }
+
+    private bool IsIgnorableOccluder(Collider collider, Transform targetGrade)
+    {
+        if (collider == null)
+            return true;
+
+        // Игнорируем саму марку (или её детей), в которую целимся.
+        if (targetGrade != null && (collider.transform == targetGrade || collider.transform.IsChildOf(targetGrade)))
+            return true;
+
+        // Игнорируем сам объект станции (если луч стартует близко).
+        if (collider.transform.IsChildOf(transform))
+            return true;
+
+        return false;
     }
 
 
@@ -2046,13 +2135,32 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             if (horizontalDist > 0 && verticalDiff / horizontalDist > Mathf.Tan(60f * Mathf.Deg2Rad))
                 continue;
 
-            if (HasLineOfSight(from, to))
+            // Контроль угла падения на марку (угол к нормали фасада).
+            float incidenceAngle = GetIncidenceAngleDeg(from, g);
+            if (incidenceAngle > maxIncidenceAngleDeg)
+                continue;
+
+            if (HasLineOfSight(from, to, g))
             {
                 visible.Add(g);
             }
         }
 
         return visible;
+    }
+
+    private float GetIncidenceAngleDeg(Vector3 stationEyePos, Transform grade)
+    {
+        if (grade == null)
+            return 180f;
+
+        Vector3 toStation = (stationEyePos - grade.position).normalized;
+        Vector3 gradeNormal = grade.forward.normalized;
+        if (gradeNormal.sqrMagnitude < 0.5f)
+            gradeNormal = Vector3.up;
+
+        // 0° = вдоль нормали, 90° = скользящий луч.
+        return Vector3.Angle(gradeNormal, toStation);
     }
     private void DebugStationCoverage(List<Station> solution)
     {
@@ -2118,7 +2226,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             }
         }
 
-        return HasLineOfSight(fromEyePos, toTargetPos);
+        return HasLineOfSight(fromEyePos, toTargetPos, grade);
     }
 
     // Построение линии
@@ -3834,7 +3942,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                     Vector3 groundPos = hit.point;
                     if (!IsInsideAnyBuilding(groundPos))
                     {
-                        candidates.Add(groundPos);
+                        if (IsCandidateDistanceValid(groundPos))
+                            candidates.Add(groundPos);
                     }
                 }
             }
@@ -3856,7 +3965,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                     Vector3 groundPos = hit.point;
                     if (!IsInsideAnyBuilding(groundPos))
                     {
-                        candidates.Add(groundPos);
+                        if (IsCandidateDistanceValid(groundPos))
+                            candidates.Add(groundPos);
                     }
                 }
             }
