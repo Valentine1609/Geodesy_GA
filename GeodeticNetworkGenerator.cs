@@ -40,6 +40,9 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     public bool showWeakLinks = true;       // показывать слабые позиции
     public float gizmoSphereSize = 0.3f;    // размер сфер для кандидатов
     public float condScale = 1000f;         // масштаб для нормализации цвета
+    [Header("Ограничения углов наблюдения")]
+    public float minIntersectionAngleDeg = 60f;   // минимальный угол пересечения лучей у марки
+    public float maxGradeApproachAngleDeg = 65f;  // максимум отклонения от -grade.forward
     private List<(Vector3 pos, double cond)> lastSuggestions;  // сохраняем последние кандидаты
 
 
@@ -736,7 +739,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                         float perpendicularity = 1f - Mathf.Clamp01(Mathf.Abs(angle - 90f) / 90f);
                         score += perpendicularity * 25f;
 
-                        if (angle < 45f || angle > 135f)
+                        if (angle < minIntersectionAngleDeg || angle > (180f - minIntersectionAngleDeg))
                             score -= 40f;
                     }
                 }
@@ -1459,10 +1462,13 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         return counts.Values.Count(v => v >= 2);
     }
 
-    private int CountMarksWithAcuteAngles(List<Station> solution, float acuteThresholdDeg = 45f)
+    private int CountMarksWithAcuteAngles(List<Station> solution, float acuteThresholdDeg = -1f)
     {
         if (solution == null || grades == null || grades.Count == 0)
             return 0;
+
+        if (acuteThresholdDeg <= 0f)
+            acuteThresholdDeg = minIntersectionAngleDeg;
 
         int acuteMarks = 0;
         foreach (var grade in grades)
@@ -1641,15 +1647,15 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                     float perpendicularity = 1f - Mathf.Clamp01(Mathf.Abs(angle - 90f) / 90f);
                     fitness += perpendicularity * 2500f;
 
-                    if (angle >= 70f && angle <= 110f)
+                    if (angle >= 75f && angle <= 105f)
                     {
                         hasGoodAngle = true;
                         fitness += 2500f;
                     }
-                    else if (angle < 45f || angle > 135f)
+                    else if (angle < minIntersectionAngleDeg || angle > (180f - minIntersectionAngleDeg))
                     {
                         // Избегаем острых/почти коллинеарных конфигураций
-                        fitness -= 8000f;
+                        fitness -= 12000f;
                     }
                 }
             }
@@ -1661,8 +1667,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         if (grades.Count > 0)
         {
             float avgMinAngle = totalMinAngle / grades.Count;
-            if (avgMinAngle >= 70f) fitness += 15000f;
-            else if (avgMinAngle < 45f) fitness -= 20000f;
+            if (avgMinAngle >= 75f) fitness += 15000f;
+            else if (avgMinAngle < minIntersectionAngleDeg) fitness -= 30000f;
         }
 
         // ================== 8. РАСПРЕДЕЛЕНИЕ ПО КВАДРАНТАМ ==================
@@ -2143,6 +2149,23 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         return true;
     }
 
+    // Проверяем, что визирование идёт "в лицо" марки:
+    // синяя ось (local Z) у марки смотрит в здание, поэтому прибор должен быть ближе к направлению -forward.
+    private bool IsValidApproachToGrade(Vector3 stationPos, Transform grade)
+    {
+        if (grade == null)
+            return false;
+
+        Vector3 gradeToStation = (stationPos - grade.position).normalized;
+        Vector3 desiredDirection = -grade.forward.normalized;
+
+        if (desiredDirection.sqrMagnitude < 0.001f)
+            return true;
+
+        float approachAngle = Vector3.Angle(gradeToStation, desiredDirection);
+        return approachAngle <= maxGradeApproachAngleDeg;
+    }
+
 
     // Получение видимых марок с позиции
     private HashSet<Transform> GetVisibleGradesFromPos(Vector3 pos)
@@ -2165,6 +2188,9 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
             // Если угол слишком крутой (> 60 градусов), пропускаем
             if (horizontalDist > 0 && verticalDiff / horizontalDist > Mathf.Tan(60f * Mathf.Deg2Rad))
+                continue;
+
+            if (!IsValidApproachToGrade(pos, g))
                 continue;
 
             if (HasLineOfSight(from, to))
@@ -2214,6 +2240,9 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     private bool CheckLineOfSightToGrade(Transform ms60, Transform grade)
     {
         if (ms60 == null || grade == null) return false;
+
+        if (!IsValidApproachToGrade(ms60.position, grade))
+            return false;
 
         // Используем ту же высоту, что и в GetVisibleGradesFromPos
         Vector3 fromEyePos = ms60.position + Vector3.up * 1.7f;
