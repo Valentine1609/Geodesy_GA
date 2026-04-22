@@ -672,7 +672,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             .ToList();
 
         if (candidatePositions == null || candidatePositions.Count == 0)
-            return refined;
+            return PruneRedundantStations(refined);
 
         const int maxExtraStations = 4;
         const float minSpacing = 6f;
@@ -759,7 +759,91 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             });
         }
 
-        return refined;
+        return PruneRedundantStations(refined);
+    }
+
+    private List<Station> PruneRedundantStations(List<Station> stations)
+    {
+        if (stations == null)
+            return new List<Station>();
+
+        var pruned = stations
+            .Where(s => s != null)
+            .Select(s => new Station
+            {
+                position = s.position,
+                visibleGrades = s.visibleGrades != null ? new HashSet<Transform>(s.visibleGrades) : GetVisibleGradesFromPos(s.position)
+            })
+            .ToList();
+
+        bool removedAny = true;
+        while (removedAny && pruned.Count > minStations)
+        {
+            removedAny = false;
+
+            foreach (var st in pruned)
+                st.visibleGrades = GetVisibleGradesFromPos(st.position);
+
+            int baseAcute = CountMarksWithAcuteAngles(pruned);
+            var obsCounts = new Dictionary<Transform, int>();
+            foreach (var grade in grades) obsCounts[grade] = 0;
+            foreach (var st in pruned)
+            {
+                foreach (var g in st.visibleGrades)
+                {
+                    if (obsCounts.ContainsKey(g)) obsCounts[g]++;
+                }
+            }
+
+            int removeIdx = -1;
+            int minCritical = int.MaxValue;
+            int minCoverage = int.MaxValue;
+
+            for (int i = 0; i < pruned.Count; i++)
+            {
+                var st = pruned[i];
+                int critical = 0;
+                foreach (var g in st.visibleGrades)
+                {
+                    if (obsCounts.TryGetValue(g, out int count) && count <= 2)
+                        critical++;
+                }
+
+                int coverage = st.visibleGrades.Count;
+                if (critical < minCritical || (critical == minCritical && coverage < minCoverage))
+                {
+                    removeIdx = i;
+                    minCritical = critical;
+                    minCoverage = coverage;
+                }
+            }
+
+            if (removeIdx < 0)
+                break;
+
+            var candidate = pruned.Where((_, idx) => idx != removeIdx).ToList();
+            foreach (var st in candidate)
+                st.visibleGrades = GetVisibleGradesFromPos(st.position);
+
+            bool valid = true;
+            foreach (var grade in grades)
+            {
+                int observers = candidate.Count(s => s.visibleGrades.Contains(grade));
+                if (observers < 2)
+                {
+                    valid = false;
+                    break;
+                }
+            }
+
+            if (valid && CountMarksWithAcuteAngles(candidate) <= baseAcute)
+            {
+                pruned = candidate;
+                removedAny = true;
+            }
+        }
+
+        return pruned;
     }
 
     // ВСПОМОГАТЕЛЬНЫЙ метод для генерации начальной популяции (обновленный)
@@ -1485,6 +1569,35 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         // ================== 5. ГЛАВНЫЙ ФИТНЕС: ПОЛНОЕ ПОКРЫТИЕ + РЕДУНДАНТНОСТЬ ==================
         float fitness = 100000f;
 
+        // Поощряем конфигурации, где отдельная станция "берёт" максимум марок,
+        // и где станции стоят дальше от марок (в пределах реалистичной дальности).
+        int maxSingleStationCoverage = 0;
+        float totalNearestDistance = 0f;
+        foreach (var station in solution)
+        {
+            maxSingleStationCoverage = Mathf.Max(maxSingleStationCoverage, station.visibleGrades.Count);
+
+            float nearest = float.MaxValue;
+            foreach (var g in grades)
+            {
+                nearest = Mathf.Min(nearest, Vector3.Distance(station.position, g.position));
+            }
+
+            if (nearest < float.MaxValue)
+                totalNearestDistance += nearest;
+        }
+
+        if (grades.Count > 0)
+            fitness += (maxSingleStationCoverage / (float)grades.Count) * 35000f;
+
+        if (solution.Count > 0)
+        {
+            float avgNearestDistance = totalNearestDistance / solution.Count;
+            // Нормируем в диапазон 0..1, целевая "дальняя" дистанция ~20м.
+            float distanceFactor = Mathf.Clamp01(avgNearestDistance / 20f);
+            fitness += distanceFactor * 18000f;
+        }
+
         // ================== 6. МИНИМИЗАЦИЯ КОЛИЧЕСТВА СТАНЦИЙ ==================
         int optimalCount = Mathf.Max(minStations, Mathf.CeilToInt(grades.Count / 2.0f));
 
@@ -1994,13 +2107,13 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         dir = toAdjusted - fromAdjusted;
         dist = dir.magnitude;
 
-        // Важный нюанс: SphereCast может ложноположительно цеплять фасад рядом с маркой,
-        // поэтому используем обычный RaycastAll и вручную фильтруем попадания у старта/финиша.
+        // Проверяем ВСЕ попадания, чтобы не пропускать здания, если они не входят в obstacleLayer.
+        // Далее вручную оставляем только реальные препятствия или коллайдеры зданий.
         RaycastHit[] hits = Physics.RaycastAll(
             fromAdjusted,
             dir.normalized,
             dist,
-            obstacleLayer,
+            ~0,
             QueryTriggerInteraction.Ignore);
 
         foreach (RaycastHit hit in hits)
@@ -2014,6 +2127,14 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 continue;
 
             if (dist - hit.distance <= endTolerance)
+                continue;
+
+            bool isBuilding =
+                hit.collider.CompareTag("building") ||
+                (hit.collider.transform.parent != null && hit.collider.transform.parent.CompareTag("building"));
+
+            bool isInObstacleMask = ((obstacleLayer.value & (1 << hit.collider.gameObject.layer)) != 0);
+            if (!isBuilding && !isInObstacleMask)
                 continue;
 
             return false;
