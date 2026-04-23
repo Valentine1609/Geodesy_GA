@@ -763,7 +763,142 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             });
         }
 
+        refined = AddPerpendicularStationsForAcuteMarks(refined, candidatePositions, minSpacing);
         return PruneRedundantStations(refined);
+    }
+
+    private List<Station> AddPerpendicularStationsForAcuteMarks(List<Station> stations, List<Vector3> candidatePositions, float minSpacing)
+    {
+        if (stations == null || candidatePositions == null || candidatePositions.Count == 0)
+            return stations ?? new List<Station>();
+
+        var improved = stations
+            .Where(s => s != null)
+            .Select(s => new Station
+            {
+                position = s.position,
+                visibleGrades = s.visibleGrades != null ? new HashSet<Transform>(s.visibleGrades) : GetVisibleGradesFromPos(s.position)
+            })
+            .ToList();
+
+        int maxExtraForAcute = Mathf.Min(4, grades.Count);
+        for (int step = 0; step < maxExtraForAcute; step++)
+        {
+            foreach (var st in improved)
+                st.visibleGrades = GetVisibleGradesFromPos(st.position);
+
+            var acuteMarks = GetAcuteMarkInfos(improved);
+            if (acuteMarks.Count == 0)
+                break;
+
+            bool added = false;
+            foreach (var acute in acuteMarks.OrderBy(a => a.minAngle))
+            {
+                var observers = improved
+                    .Where(s => s.visibleGrades != null && s.visibleGrades.Contains(acute.grade))
+                    .ToList();
+
+                if (observers.Count == 0)
+                    continue;
+
+                var baseObserver = observers
+                    .OrderByDescending(s => s.visibleGrades.Count)
+                    .First();
+
+                Vector3 baseDir = (baseObserver.position - acute.grade.position).normalized;
+                Vector3 blueAxis = acute.grade.forward.normalized;
+
+                Vector3? bestPos = null;
+                HashSet<Transform> bestVisible = null;
+                float bestScore = float.MinValue;
+
+                foreach (var candidatePos in candidatePositions)
+                {
+                    if (improved.Any(s => Vector3.Distance(s.position, candidatePos) < minSpacing))
+                        continue;
+
+                    if (IsInsideAnyBuilding(candidatePos))
+                        continue;
+
+                    var visible = GetVisibleGradesFromPos(candidatePos);
+                    if (visible == null || !visible.Contains(acute.grade))
+                        continue;
+
+                    Vector3 candDir = (candidatePos - acute.grade.position).normalized;
+                    float angleToBase = Vector3.Angle(baseDir, candDir);
+                    if (angleToBase < minIntersectionAngleDeg)
+                        continue;
+
+                    float angleToBlue = Vector3.Angle(candDir, blueAxis);
+                    float score = 0f;
+
+                    // Нужно получить максимально перпендикулярный к синей оси визирный луч.
+                    score -= Mathf.Abs(angleToBlue - targetPerpendicularToBlueDeg) * 5f;
+                    // И близко к 90° относительно существующего наблюдателя для устранения острого угла.
+                    score -= Mathf.Abs(angleToBase - 90f) * 3f;
+                    score += visible.Count * 2f;
+
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestPos = candidatePos;
+                        bestVisible = visible;
+                    }
+                }
+
+                if (bestPos.HasValue && bestVisible != null)
+                {
+                    improved.Add(new Station
+                    {
+                        position = bestPos.Value,
+                        visibleGrades = bestVisible
+                    });
+
+                    added = true;
+                    break;
+                }
+            }
+
+            if (!added)
+                break;
+        }
+
+        return improved;
+    }
+
+    private List<(Transform grade, float minAngle)> GetAcuteMarkInfos(List<Station> solution)
+    {
+        var result = new List<(Transform grade, float minAngle)>();
+        if (solution == null || grades == null || grades.Count == 0)
+            return result;
+
+        foreach (var grade in grades)
+        {
+            var observers = solution
+                .Where(st => st?.visibleGrades != null && st.visibleGrades.Contains(grade))
+                .Select(st => st.position)
+                .ToList();
+
+            if (observers.Count < 2)
+                continue;
+
+            float minAngle = 180f;
+            for (int i = 0; i < observers.Count - 1; i++)
+            {
+                for (int j = i + 1; j < observers.Count; j++)
+                {
+                    float angle = Vector3.Angle(
+                        (observers[i] - grade.position).normalized,
+                        (observers[j] - grade.position).normalized);
+                    minAngle = Mathf.Min(minAngle, angle);
+                }
+            }
+
+            if (minAngle < minIntersectionAngleDeg)
+                result.Add((grade, minAngle));
+        }
+
+        return result;
     }
 
     private List<Station> PruneRedundantStations(List<Station> stations)
