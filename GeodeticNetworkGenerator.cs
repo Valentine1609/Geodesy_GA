@@ -1098,34 +1098,43 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     {
         var candidates = new List<Vector3>();
 
-        // ОГРАНИЧИВАЕМ количество точек при большом количестве марок
-        int pointsPerSide = grades.Count > 15 ? 15 : 30;
-        float rayStartOffset = 30f; // Уменьшено
+        // УВЕЛИЧИВАЕМ количество точек при большом количестве марок для лучшего покрытия
+        int pointsPerSide = grades.Count > 15 ? 24 : 48; // Увеличено для более равномерного распределения
+        float rayStartOffset = 50f; // Увеличено для более дальних позиций
 
-        // УПРОЩАЕМ генерацию: только основные направления
-        for (int i = 0; i < 360; i += 360 / pointsPerSide)
+        // Генерируем позиции на НЕСКОЛЬКИХ расстояниях от здания для выбора оптимального
+        // Добавлены еще более дальние дистанции для поиска перпендикулярных углов
+        float[] distanceMultipliers = { 0.7f, 0.9f, 1.1f, 1.4f, 1.7f, 2.0f };
+
+        foreach (float distMult in distanceMultipliers)
         {
-            float angle = i * Mathf.Deg2Rad;
-
-            // Генерируем только на оптимальном расстоянии, не несколько вариантов
-            Vector3 dir = new Vector3(Mathf.Cos(angle), 0, Mathf.Sin(angle));
-            Vector3 point = bounds.center + dir * offset;
-
-            Vector3 rayStart = point + Vector3.up * rayStartOffset;
-
-            if (Physics.Raycast(rayStart, Vector3.down, out RaycastHit hit,
-                rayStartOffset + 20f, groundLayer)) // Уменьшен диапазон
+            float currentOffset = offset * distMult;
+            
+            for (int i = 0; i < 360; i += 360 / pointsPerSide)
             {
-                Vector3 groundPos = hit.point;
+                float angle = i * Mathf.Deg2Rad;
 
-                // Быстрая проверка на нахождение в здании
-                if (!IsInsideAnyBuilding(groundPos))
+                Vector3 dir = new Vector3(Mathf.Cos(angle), 0, Mathf.Sin(angle));
+                Vector3 point = bounds.center + dir * currentOffset;
+
+                Vector3 rayStart = point + Vector3.up * rayStartOffset;
+
+                if (Physics.Raycast(rayStart, Vector3.down, out RaycastHit hit,
+                    rayStartOffset + 50f, groundLayer))
                 {
-                    // Проверяем минимальное расстояние до стены
-                    Vector3 wallPoint = buildingCollider.ClosestPoint(groundPos);
-                    if (Vector3.Distance(groundPos, wallPoint) > 3.0f) // Уменьшен минимум
+                    Vector3 groundPos = hit.point;
+
+                    // Быстрая проверка на нахождение в здании
+                    if (!IsInsideAnyBuilding(groundPos))
                     {
-                        candidates.Add(groundPos);
+                        // Проверяем минимальное расстояние до стены - УВЕЛИЧЕНО для более дальнего размещения
+                        Vector3 wallPoint = buildingCollider.ClosestPoint(groundPos);
+                        float minDistanceFromWall = Mathf.Max(5.0f, offset * 0.5f);
+                        
+                        if (Vector3.Distance(groundPos, wallPoint) > minDistanceFromWall)
+                        {
+                            candidates.Add(groundPos);
+                        }
                     }
                 }
             }
@@ -1190,12 +1199,13 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
     private float CalculateOptimalDistance(Bounds bounds)
     {
-        // УМЕНЬШАЕМ расстояния для более близкого размещения
+        // УВЕЛИЧИВАЕМ расстояния для более дальнего размещения станций от здания
+        // Это помогает получить более перпендикулярные углы наблюдения
         float buildingSize = bounds.size.magnitude;
-        float minDistance = Mathf.Max(buildingSize * 0.1f, 6f);  // 
-        float maxDistance = Mathf.Max(buildingSize * 0.3f, 12f); // 
+        float minDistance = Mathf.Max(buildingSize * 0.2f, 10f);  // Увеличено с 0.1 до 0.2 и с 6 до 10
+        float maxDistance = Mathf.Max(buildingSize * 0.5f, 20f);  // Увеличено с 0.3 до 0.5 и с 12 до 20
 
-        Debug.Log($"Размер здания: {buildingSize:F1}m, оптимальное расстояние: {minDistance:F1}-{maxDistance:F1}m");
+        Debug.Log($"Размер здания: {buildingSize:F1}m, оптимальное расстояние: {minDistance:F1}-{maxDistance:F1}m (для перпендикулярных углов)");
         return (minDistance + maxDistance) / 2f;
     }
 
@@ -1215,7 +1225,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         }
 
         // ================== 2. ПРОВЕРКА НА СЛИШКОМ БЛИЗКОЕ РАСПОЛОЖЕНИЕ ==================
-        float minAllowedDistance = 8f; // реалистичное значение
+        float minAllowedDistance = 6f; // Уменьшено с 8 до 6 для большей гибкости размещения
         for (int i = 0; i < solution.Count; i++)
         {
             for (int j = i + 1; j < solution.Count; j++)
@@ -1287,9 +1297,11 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             fitness += (optimalCount - solution.Count) * 10000f;
         }
 
-        // ================== 7. ПРОВЕРКА УГЛОВ НАБЛЮДЕНИЯ (3D) ==================
+        // ================== 7. ПРОВЕРКА УГЛОВ НАБЛЮДЕНИЯ (3D) - КРИТИЧЕСКИ ВАЖНО ==================
+        // Стремимся к тому, чтобы станции стояли как можно более перпендикулярно к маркам
         int marksWithGoodAngles = 0;
         float totalMinAngle = 0f;
+        float totalPerpendicularScore = 0f; // Новая метрика: насколько углы близки к 90°
 
         foreach (var grade in grades)
         {
@@ -1302,6 +1314,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
             bool hasGoodAngle = false;
             float minAngle = 180f;
+            float bestPerpendicularAngle = 0f; // Угол, наиболее близкий к 90°
 
             for (int i = 0; i < observingStations.Count - 1; i++)
             {
@@ -1313,26 +1326,73 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
                     minAngle = Mathf.Min(minAngle, angle);
 
-                    if (angle >= 60f && angle <= 120f)
+                    // Вычисляем отклонение от идеального угла 90°
+                    float deviationFrom90 = Mathf.Abs(angle - 90f);
+                    
+                    // Запоминаем лучший (самый близкий к 90°) угол для этой марки
+                    if (deviationFrom90 < bestPerpendicularAngle || bestPerpendicularAngle == 0f)
+                        bestPerpendicularAngle = deviationFrom90;
+
+                    // ЗНАЧИТЕЛЬНО УСИЛЕННЫЕ ШТРАФЫ И БОНУСЫ ЗА УГЛЫ:
+                    if (angle >= 75f && angle <= 105f)
                     {
+                        // Идеальный диапазон: близко к 90° - МАКСИМАЛЬНЫЙ БОНУС
                         hasGoodAngle = true;
-                        fitness += 2000f;
+                        fitness += 5000f;
+                        totalPerpendicularScore += (90f - deviationFrom90); // Бонус за близость к 90°
+                    }
+                    else if (angle >= 60f && angle <= 120f)
+                    {
+                        // Хороший диапазон - хороший бонус
+                        hasGoodAngle = true;
+                        fitness += 3000f;
+                        totalPerpendicularScore += (90f - deviationFrom90) * 0.5f;
+                    }
+                    else if (angle >= 45f && angle < 60f || angle > 120f && angle <= 135f)
+                    {
+                        // Допустимый диапазон - небольшой бонус
+                        fitness += 500f;
                     }
                     else if (angle < 30f || angle > 150f)
                     {
-                        fitness -= 5000f;
+                        // КРИТИЧЕСКИ ПЛОХОЙ угол - ОЧЕНЬ БОЛЬШОЙ ШТРАФ
+                        fitness -= 15000f;
+                    }
+                    else if (angle < 45f || angle > 135f)
+                    {
+                        // Плохой угол - большой штраф
+                        fitness -= 8000f;
                     }
                 }
             }
 
             totalMinAngle += minAngle;
-            if (hasGoodAngle) marksWithGoodAngles++;
+            
+            // Дополнительный бонус если марка имеет хотя бы один угол близкий к 90°
+            if (bestPerpendicularAngle <= 15f)
+            {
+                fitness += 3000f; // Бонус за наличие угла в пределах 75-105°
+                marksWithGoodAngles++;
+            }
+            else if (bestPerpendicularAngle <= 30f)
+            {
+                fitness += 1500f; // Меньший бонус за угол в пределах 60-120°
+            }
         }
 
+        // Бонус за средний минимальный угол между станциями
         if (grades.Count > 0)
         {
             float avgMinAngle = totalMinAngle / grades.Count;
-            if (avgMinAngle >= 50f) fitness += 10000f;
+            if (avgMinAngle >= 70f) fitness += 20000f;  // Отлично
+            else if (avgMinAngle >= 50f) fitness += 10000f;  // Хорошо
+            else if (avgMinAngle < 30f) fitness -= 15000f;  // Плохо
+        }
+
+        // Бонус за общую перпендикулярность сети
+        if (totalPerpendicularScore > 0)
+        {
+            fitness += totalPerpendicularScore * 50f; // Прямой бонус за углы близкие к 90°
         }
 
         // ================== 8. РАСПРЕДЕЛЕНИЕ ПО КВАДРАНТАМ ==================
@@ -1647,19 +1707,19 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             return false;
         }
 
-        // 2. Проверка расстояния до стен здания
+        // 2. Проверка расстояния до стен здания - УВЕЛИЧЕНО для более дальнего размещения
         Vector3 closestPoint = buildingCollider.ClosestPoint(spawn);
         float distanceToWall = Vector3.Distance(spawn, closestPoint);
 
-        // Минимальное расстояние до стены (увеличим для безопасности)
-        float minWallDistance = 2.0f;
+        // Минимальное расстояние до стены (увеличено с 2.0 до 4.0 для безопасности и перпендикулярности)
+        float minWallDistance = 4.0f;
         if (distanceToWall < minWallDistance)
         {
             Debug.LogWarning($"Станция слишком близко к стене! Расстояние: {distanceToWall:F1}m");
 
             // Пытаемся отодвинуть станцию от стены
             Vector3 awayFromWall = (spawn - closestPoint).normalized;
-            Vector3 adjustedPos = spawn + awayFromWall * (minWallDistance - distanceToWall);
+            Vector3 adjustedPos = spawn + awayFromWall * (minWallDistance - distanceToWall + 2f); // +2f для дополнительного запаса
 
             // Проверяем новую позицию
             if (!IsInsideAnyBuilding(adjustedPos))
@@ -1692,8 +1752,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             return false;
         }
 
-        // 5. Проверка расстояния до других станций
-        float minStationDistance = 5f;
+        // 5. Проверка расстояния до других станций - УМЕНЬШЕНО для большей гибкости
+        float minStationDistance = 4f; // Уменьшено с 5 до 4
         foreach (var existingStation in selectedStations)
         {
             if (Vector3.Distance(existingStation.position, spawn) < minStationDistance)
@@ -1811,12 +1871,12 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     }
 
 
-    // Проверка прямой видимости между точками
+    // Проверка прямой видимости между точками - ИСПРАВЛЕННАЯ ВЕРСИЯ
     private bool HasLineOfSight(Vector3 fromPos, Vector3 toPos)
     {
         float maxDistance = 100f;
-        float startTolerance = 0.2f;
-        float endTolerance = 0.35f;
+        float startTolerance = 0.3f;  // Увеличено для избежания ложных срабатываний
+        float endTolerance = 0.5f;    // Увеличено для избежания ложных срабатываний
 
         Vector3 dir = toPos - fromPos;
         float dist = dir.magnitude;
@@ -1825,13 +1885,42 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         if (dist <= 0.001f) return true;
 
         // Поднимаем луч чуть выше земли, чтобы избежать ложных срабатываний
-        Vector3 fromAdjusted = fromPos + Vector3.up * 0.1f;
-        Vector3 toAdjusted = toPos + Vector3.up * 0.1f;
+        Vector3 fromAdjusted = fromPos + Vector3.up * 0.15f;
+        Vector3 toAdjusted = toPos + Vector3.up * 0.15f;
         dir = toAdjusted - fromAdjusted;
         dist = dir.magnitude;
 
-        // Важный нюанс: SphereCast может ложноположительно цеплять фасад рядом с маркой,
-        // поэтому используем обычный RaycastAll и вручную фильтруем попадания у старта/финиша.
+        // ВАЖНО: Используем SphereCast вместо RaycastAll для более надежной проверки
+        // SphereCast учитывает объемные объекты и не пропускает тонкие препятствия
+        float sphereRadius = 0.1f; // Радиус сферы для проверки
+        
+        RaycastHit hit;
+        bool hasHit = Physics.SphereCast(
+            fromAdjusted,
+            sphereRadius,
+            dir.normalized,
+            out hit,
+            dist - sphereRadius * 2f,
+            obstacleLayer,
+            QueryTriggerInteraction.Ignore);
+
+        if (hasHit)
+        {
+            // Проверяем, не является ли попадание слишком близким к началу или концу
+            if (hit.distance <= startTolerance)
+                return true; // Игнорируем попадания у старта
+
+            float distanceFromEnd = dist - hit.distance;
+            if (distanceFromEnd <= endTolerance)
+                return true; // Игнорируем попадания у конца
+
+            // Если попали в препятствие посередине - нет видимости
+            Debug.DrawLine(fromAdjusted, toAdjusted, Color.red, 2f);
+            return false;
+        }
+
+        // Дополнительная проверка: RaycastAll для обнаружения любых препятствий
+        // Это запасной вариант на случай если SphereCast что-то пропустил
         RaycastHit[] hits = Physics.RaycastAll(
             fromAdjusted,
             dir.normalized,
@@ -1839,19 +1928,20 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             obstacleLayer,
             QueryTriggerInteraction.Ignore);
 
-        foreach (RaycastHit hit in hits)
+        foreach (RaycastHit rayHit in hits)
         {
-            if (hit.collider == null)
+            if (rayHit.collider == null)
                 continue;
 
-            // Игнорируем попадания слишком близко к станции или к самой цели.
-            // Это устраняет случай, когда луч касается геометрии марки/фасада у конца.
-            if (hit.distance <= startTolerance)
+            // Игнорируем попадания слишком близко к станции или к самой цели
+            if (rayHit.distance <= startTolerance)
                 continue;
 
-            if (dist - hit.distance <= endTolerance)
+            if (dist - rayHit.distance <= endTolerance)
                 continue;
 
+            // Нашли препятствие посередине пути
+            Debug.DrawLine(fromAdjusted, toAdjusted, Color.red, 2f);
             return false;
         }
 
@@ -2009,6 +2099,40 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         lr.SetPosition(0, start);
         lr.SetPosition(1, end);
         lr.useWorldSpace = true;
+        
+        // ВАЖНО: Добавляем проверку на препятствия для линии
+        // Если линия проходит сквозь коллайдер, разбиваем её на сегменты
+        Vector3 fromAdjusted = start + Vector3.up * 0.15f;
+        Vector3 toAdjusted = end + Vector3.up * 0.15f;
+        Vector3 dir = toAdjusted - fromAdjusted;
+        float dist = dir.magnitude;
+        
+        if (dist > 0.001f)
+        {
+            RaycastHit[] hits = Physics.RaycastAll(
+                fromAdjusted,
+                dir.normalized,
+                dist,
+                obstacleLayer,
+                QueryTriggerInteraction.Ignore);
+            
+            // Если есть препятствия посередине, рисуем линию красным вместо зеленого
+            foreach (RaycastHit hit in hits)
+            {
+                if (hit.collider == null) continue;
+                
+                float startTolerance = 0.3f;
+                float endTolerance = 0.5f;
+                
+                if (hit.distance <= startTolerance) continue;
+                if (dist - hit.distance <= endTolerance) continue;
+                
+                // Нашли препятствие - меняем цвет на красный и логируем
+                lr.startColor = lr.endColor = Color.red;
+                Debug.LogWarning($"Линия от {start} до {end} проходит сквозь препятствие: {hit.collider.name}");
+                break;
+            }
+        }
     }
 
 
