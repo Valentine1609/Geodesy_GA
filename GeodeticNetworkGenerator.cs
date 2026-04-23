@@ -674,6 +674,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         if (candidatePositions == null || candidatePositions.Count == 0)
             return PruneRedundantStations(refined);
 
+        AddPerpendicularStationsForAcuteMarks(refined, candidatePositions, bounds, maxFixes: 3);
+
         const int maxExtraStations = 4;
         const float minSpacing = 6f;
 
@@ -759,7 +761,126 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             });
         }
 
+        AddPerpendicularStationsForAcuteMarks(refined, candidatePositions, bounds, maxFixes: 2);
+
         return PruneRedundantStations(refined);
+    }
+
+    private void AddPerpendicularStationsForAcuteMarks(
+        List<Station> stations,
+        List<Vector3> candidatePositions,
+        Bounds bounds,
+        int maxFixes)
+    {
+        if (stations == null || candidatePositions == null || grades == null || maxFixes <= 0)
+            return;
+
+        const float targetMinAngle = 70f;
+        const float targetMaxAngle = 110f;
+        const float minSpacing = 8f;
+        const float preferredDistanceFromBuilding = 22f;
+
+        for (int step = 0; step < maxFixes; step++)
+        {
+            foreach (var st in stations)
+                st.visibleGrades = GetVisibleGradesFromPos(st.position);
+
+            Transform weakGrade = null;
+            float weakestAngle = 180f;
+            List<Station> observers = null;
+
+            foreach (var grade in grades)
+            {
+                var gradeObservers = stations
+                    .Where(st => st.visibleGrades != null && st.visibleGrades.Contains(grade))
+                    .ToList();
+
+                if (gradeObservers.Count < 1)
+                    continue;
+
+                if (gradeObservers.Count == 1)
+                {
+                    weakGrade = grade;
+                    weakestAngle = 0f;
+                    observers = gradeObservers;
+                    break;
+                }
+
+                float bestAngleForGrade = 0f;
+                for (int i = 0; i < gradeObservers.Count - 1; i++)
+                {
+                    for (int j = i + 1; j < gradeObservers.Count; j++)
+                    {
+                        Vector3 dir1 = (gradeObservers[i].position - grade.position).normalized;
+                        Vector3 dir2 = (gradeObservers[j].position - grade.position).normalized;
+                        float angle = Vector3.Angle(dir1, dir2);
+                        bestAngleForGrade = Mathf.Max(bestAngleForGrade, angle);
+                    }
+                }
+
+                if (bestAngleForGrade < targetMinAngle && bestAngleForGrade < weakestAngle)
+                {
+                    weakGrade = grade;
+                    weakestAngle = bestAngleForGrade;
+                    observers = gradeObservers;
+                }
+            }
+
+            if (weakGrade == null || observers == null)
+                break;
+
+            Vector3? bestCandidate = null;
+            HashSet<Transform> bestVisible = null;
+            float bestScore = float.MinValue;
+
+            foreach (var candidate in candidatePositions)
+            {
+                if (stations.Any(st => Vector3.Distance(st.position, candidate) < minSpacing))
+                    continue;
+                if (IsInsideAnyBuilding(candidate))
+                    continue;
+
+                var visible = GetVisibleGradesFromPos(candidate);
+                if (visible == null || !visible.Contains(weakGrade))
+                    continue;
+
+                float bestPerpendicularity = 0f;
+                float bestAngle = 0f;
+                foreach (var obs in observers)
+                {
+                    Vector3 dir1 = (obs.position - weakGrade.position).normalized;
+                    Vector3 dir2 = (candidate - weakGrade.position).normalized;
+                    float angle = Vector3.Angle(dir1, dir2);
+                    float perpendicularity = 1f - Mathf.Clamp01(Mathf.Abs(angle - 90f) / 90f);
+                    if (perpendicularity > bestPerpendicularity)
+                    {
+                        bestPerpendicularity = perpendicularity;
+                        bestAngle = angle;
+                    }
+                }
+
+                float distanceFromBuilding = Vector3.Distance(candidate, bounds.center);
+                float distanceBonus = Mathf.Clamp01(distanceFromBuilding / preferredDistanceFromBuilding);
+                float angleBonus = (bestAngle >= targetMinAngle && bestAngle <= targetMaxAngle) ? 1f : 0f;
+                float score = bestPerpendicularity * 200f + angleBonus * 100f + distanceBonus * 40f + visible.Count * 8f;
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestCandidate = candidate;
+                    bestVisible = visible;
+                }
+            }
+
+            if (!bestCandidate.HasValue || bestVisible == null)
+                break;
+
+            stations.Add(new Station
+            {
+                position = bestCandidate.Value,
+                visibleGrades = bestVisible
+            });
+        }
     }
 
     private List<Station> PruneRedundantStations(List<Station> stations)
@@ -1459,7 +1580,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         return counts.Values.Count(v => v >= 2);
     }
 
-    private int CountMarksWithAcuteAngles(List<Station> solution, float acuteThresholdDeg = 45f)
+    private int CountMarksWithAcuteAngles(List<Station> solution, float acuteThresholdDeg = 60f)
     {
         if (solution == null || grades == null || grades.Count == 0)
             return 0;
@@ -1641,15 +1762,15 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                     float perpendicularity = 1f - Mathf.Clamp01(Mathf.Abs(angle - 90f) / 90f);
                     fitness += perpendicularity * 2500f;
 
-                    if (angle >= 70f && angle <= 110f)
+                    if (angle >= 80f && angle <= 100f)
                     {
                         hasGoodAngle = true;
-                        fitness += 2500f;
+                        fitness += 3200f;
                     }
-                    else if (angle < 45f || angle > 135f)
+                    else if (angle < 60f || angle > 120f)
                     {
                         // Избегаем острых/почти коллинеарных конфигураций
-                        fitness -= 8000f;
+                        fitness -= 12000f;
                     }
                 }
             }
@@ -1661,8 +1782,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         if (grades.Count > 0)
         {
             float avgMinAngle = totalMinAngle / grades.Count;
-            if (avgMinAngle >= 70f) fitness += 15000f;
-            else if (avgMinAngle < 45f) fitness -= 20000f;
+            if (avgMinAngle >= 75f) fitness += 18000f;
+            else if (avgMinAngle < 60f) fitness -= 26000f;
         }
 
         // ================== 8. РАСПРЕДЕЛЕНИЕ ПО КВАДРАНТАМ ==================
