@@ -2243,7 +2243,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     }
 
     // Построение линии
-    private void BuildLine(Vector3 start, Vector3 end, Color color, float width = 0.005f)
+    private void BuildLine(Vector3 start, Vector3 end, Color color, float width = 0.02f)
     {
         GameObject lineObj = new GameObject("Line");
         lineObj.transform.SetParent(parentContainer, true);
@@ -2663,7 +2663,6 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         AppendToNetworkReportUI(accuracyHeader);
 
         string accuracyNote = "⚠️ Для абсолютных ошибок требуется апостериорная дисперсия из невязок!";
-        Debug.Log("Внимание: для абсолютных ошибок требуется апостериорная дисперсия из невязок!");
         AppendToNetworkReportUI(accuracyNote);
 
         double maxSigma = 0, sumSigma = 0;
