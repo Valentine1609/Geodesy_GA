@@ -2946,6 +2946,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             }
         }
 
+        AddInterStationLinksToNormalMatrix(N, nStations, n, wDist);
+
         // ===== ПОЛНАЯ ФИКСАЦИЯ БАЗИСА (7 условий Хельмерта для Unity) =====
         if (nStations >= 1)
         {
@@ -3160,7 +3162,50 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             }
         }
 
+        AddInterStationLinksToNormalMatrix(N, nStations, n, wDist);
+
         return N;
+    }
+
+    private void AddInterStationLinksToNormalMatrix(double[,] N, int nStations, int n, double weight)
+    {
+        if (N == null || nStations < 2) return;
+
+        for (int si = 0; si < nStations - 1; si++)
+        {
+            var stA = selectedStations[si];
+            if (stA?.ms60 == null) continue;
+
+            Vector3 a = stA.ms60.position;
+            int siIdx = si * 3;
+
+            for (int sj = si + 1; sj < nStations; sj++)
+            {
+                var stB = selectedStations[sj];
+                if (stB?.ms60 == null) continue;
+
+                Vector3 b = stB.ms60.position;
+
+                Vector3 d = b - a;
+                double dx = d.x, dy = d.y, dz = d.z;
+                double r = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+                if (r < 1e-6) continue;
+
+                int sjIdx = sj * 3;
+                double[] row = new double[n];
+
+                // Расстояние между станциями rij = |Sj - Si|
+                row[siIdx + 0] = -dx / r;
+                row[siIdx + 1] = -dy / r;
+                row[siIdx + 2] = -dz / r;
+
+                row[sjIdx + 0] = dx / r;
+                row[sjIdx + 1] = dy / r;
+                row[sjIdx + 2] = dz / r;
+
+                AccumulateRowToN(N, row, weight);
+            }
+        }
     }
 
     // ==========================================================================
