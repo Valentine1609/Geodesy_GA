@@ -365,8 +365,11 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                         {
                             Debug.Log($"🎯 Ранний выход: найдено оптимальное решение на поколении {generation}");
                             stopwatch.Stop();
-                            return EnsureClosedTraverseConnectivity(
-                                RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider),
+                            return EnsureExcellentConditioning(
+                                EnsureClosedTraverseConnectivity(
+                                    RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider),
+                                    candidatePositions,
+                                    bounds),
                                 candidatePositions,
                                 bounds);
                         }
@@ -642,15 +645,21 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                     float fallbackFitness = CalculateFitness(fallback, bounds, buildingCollider);
 
                     var candidateBest = fallbackFitness > bestFitnessVal ? fallback : bestSolution;
-                    return EnsureClosedTraverseConnectivity(
-                        RefineSolutionForRedundancyAndAngles(candidateBest, candidatePositions, bounds, buildingCollider),
+                    return EnsureExcellentConditioning(
+                        EnsureClosedTraverseConnectivity(
+                            RefineSolutionForRedundancyAndAngles(candidateBest, candidatePositions, bounds, buildingCollider),
+                            candidatePositions,
+                            bounds),
                         candidatePositions,
                         bounds);
                 }
             }
 
-            return EnsureClosedTraverseConnectivity(
-                RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider),
+            return EnsureExcellentConditioning(
+                EnsureClosedTraverseConnectivity(
+                    RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider),
+                    candidatePositions,
+                    bounds),
                 candidatePositions,
                 bounds);
         }
@@ -658,8 +667,11 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         {
             Debug.LogWarning("ГА не нашел решения, используем fallback");
             var fallback = GenerateFallbackSolution(bounds, buildingCollider, baseOffset);
-            return EnsureClosedTraverseConnectivity(
-                RefineSolutionForRedundancyAndAngles(fallback, candidatePositions, bounds, buildingCollider),
+            return EnsureExcellentConditioning(
+                EnsureClosedTraverseConnectivity(
+                    RefineSolutionForRedundancyAndAngles(fallback, candidatePositions, bounds, buildingCollider),
+                    candidatePositions,
+                    bounds),
                 candidatePositions,
                 bounds);
         }
@@ -1858,6 +1870,140 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         return acuteMarks;
     }
 
+    private const double ExcellentConditionThreshold = 1000.0;
+
+    private List<Station> EnsureExcellentConditioning(List<Station> stations, List<Vector3> candidatePositions, Bounds bounds)
+    {
+        var improved = OrderStationsAsClosedTraverse(stations, bounds);
+        if (candidatePositions == null || candidatePositions.Count == 0)
+            return improved;
+
+        double currentCond = CalculatePlanConditionNumberForSolution(improved);
+        if (currentCond <= ExcellentConditionThreshold)
+        {
+            Debug.Log($"Число обусловленности сети отличное: {currentCond:N0}");
+            return improved;
+        }
+
+        const int maxConditionStations = 4;
+        const float minSpacing = 6f;
+        for (int step = 0; step < maxConditionStations && currentCond > ExcellentConditionThreshold; step++)
+        {
+            Vector3? bestPos = null;
+            HashSet<Transform> bestVisible = null;
+            double bestCond = currentCond;
+
+            foreach (var candidate in candidatePositions)
+            {
+                if (IsInsideAnyBuilding(candidate))
+                    continue;
+
+                if (improved.Any(st => Vector3.Distance(st.position, candidate) < minSpacing))
+                    continue;
+
+                var visible = GetVisibleGradesFromPos(candidate);
+                if (visible == null || visible.Count < 2)
+                    continue;
+
+                var trial = improved.Select(st => new Station
+                {
+                    position = st.position,
+                    visibleGrades = st.visibleGrades != null ? new HashSet<Transform>(st.visibleGrades) : GetVisibleGradesFromPos(st.position)
+                }).ToList();
+                trial.Add(new Station { position = candidate, visibleGrades = visible });
+
+                double trialCond = CalculatePlanConditionNumberForSolution(trial);
+                if (trialCond < bestCond)
+                {
+                    bestCond = trialCond;
+                    bestPos = candidate;
+                    bestVisible = visible;
+                }
+            }
+
+            if (bestPos == null || bestVisible == null)
+                break;
+
+            improved.Add(new Station { position = bestPos.Value, visibleGrades = bestVisible });
+            improved = EnsureClosedTraverseConnectivity(improved, candidatePositions, bounds);
+            currentCond = CalculatePlanConditionNumberForSolution(improved);
+            Debug.Log($"Добавлена станция для улучшения обусловленности: cond={currentCond:N0}");
+        }
+
+        if (currentCond > ExcellentConditionThreshold)
+            Debug.LogWarning($"Не удалось довести число обусловленности до отличного: cond={currentCond:N0}, целевое < {ExcellentConditionThreshold:N0}");
+
+        return OrderStationsAsClosedTraverse(improved, bounds);
+    }
+
+    private double CalculatePlanConditionNumberForSolution(List<Station> solution)
+    {
+        if (solution == null || grades == null || grades.Count == 0)
+            return double.PositiveInfinity;
+
+        int n = grades.Count * 2;
+        double[,] normal = new double[n, n];
+        double sigmaDist = Math.Max(1e-6, DistanceStdevMm / 1000.0);
+        double wDist = 1.0 / (sigmaDist * sigmaDist);
+        double sigmaAngRad = Math.Max(1e-12, (DirectionStdevCc / 100.0) * (Math.PI / (180.0 * 3600.0)));
+        double wAng = 1.0 / (sigmaAngRad * sigmaAngRad);
+
+        for (int si = 0; si < solution.Count; si++)
+        {
+            var station = solution[si];
+            if (station == null)
+                continue;
+
+            if (station.visibleGrades == null || station.visibleGrades.Count == 0)
+                station.visibleGrades = GetVisibleGradesFromPos(station.position);
+
+            foreach (var grade in station.visibleGrades)
+            {
+                int gi = grades.IndexOf(grade);
+                if (gi < 0)
+                    continue;
+
+                Vector3 d = grade.position - station.position;
+                double dx = d.x;
+                double dz = d.z;
+                double r = Math.Sqrt(dx * dx + dz * dz);
+                if (r < 1e-6)
+                    continue;
+
+                int idx = gi * 2;
+
+                double[] distanceRow = new double[n];
+                distanceRow[idx] = dx / r;
+                distanceRow[idx + 1] = dz / r;
+                AccumulateRowToN(normal, distanceRow, wDist);
+
+                double r2 = r * r;
+                double[] directionRow = new double[n];
+                directionRow[idx] = dz / r2;
+                directionRow[idx + 1] = -dx / r2;
+                AccumulateRowToN(normal, directionRow, wAng);
+            }
+        }
+
+        const double regularization = 1e-9;
+        for (int i = 0; i < n; i++)
+            normal[i, i] += regularization;
+
+        if (!JacobiEigenDecomposition(normal, out double[] eigenValues, out _))
+            return double.PositiveInfinity;
+
+        double maxEig = eigenValues.Max();
+        double minEig = eigenValues
+            .Where(v => v > regularization * 10.0)
+            .DefaultIfEmpty(0.0)
+            .Min();
+
+        if (minEig <= 0.0 || maxEig <= 0.0)
+            return double.PositiveInfinity;
+
+        return maxEig / minEig;
+    }
+
     // Расчет приспособленности решения
     private float CalculateFitness(List<Station> solution, Bounds bounds, Collider buildingCollider)
     {
@@ -2093,6 +2239,24 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 if (total > 0 && common > total * 0.8f)
                     fitness -= 3000f;
             }
+        }
+
+        // ================== 9.2. ЧИСЛО ОБУСЛОВЛЕННОСТИ ==================
+        double planCondition = CalculatePlanConditionNumberForSolution(solution);
+        if (double.IsInfinity(planCondition) || double.IsNaN(planCondition))
+        {
+            fitness -= 250000f;
+        }
+        else if (planCondition <= ExcellentConditionThreshold)
+        {
+            // Требуем именно "отличную" геометрию по шкале отчёта: cond < 1000.
+            fitness += 300000f;
+            fitness += (float)Mathf.Clamp01((float)(1.0 - planCondition / ExcellentConditionThreshold)) * 100000f;
+        }
+        else
+        {
+            float conditionPenalty = Mathf.Clamp((float)Math.Log10(planCondition / ExcellentConditionThreshold + 1.0), 0f, 6f);
+            fitness -= conditionPenalty * 90000f;
         }
 
         // ================== 10. ФИНАЛЬНЫЙ ШТРАФ/БОНУС ==================
