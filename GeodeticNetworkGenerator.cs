@@ -365,7 +365,10 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                         {
                             Debug.Log($"🎯 Ранний выход: найдено оптимальное решение на поколении {generation}");
                             stopwatch.Stop();
-                            return OrderStationsAsClosedTraverse(RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider), bounds);
+                            return EnsureClosedTraverseConnectivity(
+                                RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider),
+                                candidatePositions,
+                                bounds);
                         }
                     }
                 }
@@ -639,17 +642,26 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                     float fallbackFitness = CalculateFitness(fallback, bounds, buildingCollider);
 
                     var candidateBest = fallbackFitness > bestFitnessVal ? fallback : bestSolution;
-                    return OrderStationsAsClosedTraverse(RefineSolutionForRedundancyAndAngles(candidateBest, candidatePositions, bounds, buildingCollider), bounds);
+                    return EnsureClosedTraverseConnectivity(
+                        RefineSolutionForRedundancyAndAngles(candidateBest, candidatePositions, bounds, buildingCollider),
+                        candidatePositions,
+                        bounds);
                 }
             }
 
-            return OrderStationsAsClosedTraverse(RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider), bounds);
+            return EnsureClosedTraverseConnectivity(
+                RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider),
+                candidatePositions,
+                bounds);
         }
         else
         {
             Debug.LogWarning("ГА не нашел решения, используем fallback");
             var fallback = GenerateFallbackSolution(bounds, buildingCollider, baseOffset);
-            return OrderStationsAsClosedTraverse(RefineSolutionForRedundancyAndAngles(fallback, candidatePositions, bounds, buildingCollider), bounds);
+            return EnsureClosedTraverseConnectivity(
+                RefineSolutionForRedundancyAndAngles(fallback, candidatePositions, bounds, buildingCollider),
+                candidatePositions,
+                bounds);
         }
     }
 
@@ -1568,6 +1580,180 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     private bool HasClosedTraverse(List<Station> stations, Bounds bounds)
     {
         return stations != null && stations.Count >= minStations && CountClosedTraverseLinks(stations, bounds) == stations.Count;
+    }
+
+    private List<Station> EnsureClosedTraverseConnectivity(List<Station> stations, List<Vector3> candidatePositions, Bounds bounds)
+    {
+        var traverse = OrderStationsAsClosedTraverse(stations, bounds);
+        if (traverse.Count < minStations || candidatePositions == null || candidatePositions.Count == 0)
+            return traverse;
+
+        const int maxRepairPasses = 4;
+        for (int pass = 0; pass < maxRepairPasses; pass++)
+        {
+            bool insertedAny = false;
+            traverse = OrderStationsAsClosedTraverse(traverse, bounds);
+
+            for (int i = 0; i < traverse.Count; i++)
+            {
+                int nextIndex = (i + 1) % traverse.Count;
+                Vector3 from = traverse[i].position + Vector3.up * 1.7f;
+                Vector3 to = traverse[nextIndex].position + Vector3.up * 1.7f;
+                if (HasLineOfSight(from, to))
+                    continue;
+
+                var bridge = FindTraverseBridgeStations(
+                    traverse[i].position,
+                    traverse[nextIndex].position,
+                    traverse,
+                    candidatePositions,
+                    bounds);
+
+                if (bridge.Count == 0)
+                {
+                    Debug.LogWarning($"Не удалось восстановить прямую видимость хода между станциями {i + 1} и {nextIndex + 1}");
+                    continue;
+                }
+
+                traverse.InsertRange(i + 1, bridge);
+                insertedAny = true;
+                Debug.Log($"Добавлено {bridge.Count} промежуточных станций для замыкания хода между {i + 1} и {nextIndex + 1}");
+                i += bridge.Count;
+            }
+
+            if (!insertedAny || HasClosedTraverse(traverse, bounds))
+                break;
+        }
+
+        return OrderStationsAsClosedTraverse(traverse, bounds);
+    }
+
+    private List<Station> FindTraverseBridgeStations(
+        Vector3 start,
+        Vector3 end,
+        List<Station> currentTraverse,
+        List<Vector3> candidatePositions,
+        Bounds bounds)
+    {
+        const int maxBridgeCandidates = 90;
+        const float minSpacing = 5f;
+
+        var center = bounds.center;
+        var startFlat = new Vector2(start.x, start.z);
+        var endFlat = new Vector2(end.x, end.z);
+
+        var repairPool = new List<Vector3>(candidatePositions);
+        repairPool.AddRange(GenerateBridgeCandidatePositions(start, end, bounds));
+
+        var bridgeCandidates = repairPool
+            .Where(pos => !IsInsideAnyBuilding(pos))
+            .Where(pos => currentTraverse.All(st => Vector3.Distance(st.position, pos) >= minSpacing))
+            .Select(pos => new
+            {
+                Position = pos,
+                Visible = GetVisibleGradesFromPos(pos),
+                SegmentDistance = DistancePointToSegment(new Vector2(pos.x, pos.z), startFlat, endFlat),
+                CenterDistance = Mathf.Abs(
+                    Vector3.Distance(new Vector3(pos.x, 0f, pos.z), new Vector3(center.x, 0f, center.z)) -
+                    (Vector3.Distance(new Vector3(start.x, 0f, start.z), new Vector3(center.x, 0f, center.z)) +
+                     Vector3.Distance(new Vector3(end.x, 0f, end.z), new Vector3(center.x, 0f, center.z))) * 0.5f)
+            })
+            .Where(x => x.Visible.Count > 0)
+            .OrderBy(x => x.SegmentDistance + x.CenterDistance * 0.25f)
+            .Take(maxBridgeCandidates)
+            .ToList();
+
+        var nodes = new List<Vector3> { start };
+        nodes.AddRange(bridgeCandidates.Select(x => x.Position));
+        nodes.Add(end);
+
+        int endNode = nodes.Count - 1;
+        var previous = Enumerable.Repeat(-1, nodes.Count).ToArray();
+        var queue = new Queue<int>();
+        queue.Enqueue(0);
+        previous[0] = 0;
+
+        while (queue.Count > 0 && previous[endNode] < 0)
+        {
+            int node = queue.Dequeue();
+            for (int other = 1; other < nodes.Count; other++)
+            {
+                if (previous[other] >= 0)
+                    continue;
+
+                if (!HasLineOfSight(nodes[node] + Vector3.up * 1.7f, nodes[other] + Vector3.up * 1.7f))
+                    continue;
+
+                previous[other] = node;
+                queue.Enqueue(other);
+                if (other == endNode)
+                    break;
+            }
+        }
+
+        if (previous[endNode] < 0)
+            return new List<Station>();
+
+        var path = new List<int>();
+        for (int at = endNode; at != 0; at = previous[at])
+            path.Add(at);
+        path.Reverse();
+
+        return path
+            .Where(idx => idx != endNode)
+            .Select(idx => new Station
+            {
+                position = nodes[idx],
+                visibleGrades = GetVisibleGradesFromPos(nodes[idx])
+            })
+            .ToList();
+    }
+
+    private List<Vector3> GenerateBridgeCandidatePositions(Vector3 start, Vector3 end, Bounds bounds)
+    {
+        var generated = new List<Vector3>();
+        Vector3 segment = end - start;
+        Vector3 horizontal = new Vector3(segment.x, 0f, segment.z);
+        if (horizontal.sqrMagnitude < 0.001f)
+            return generated;
+
+        Vector3 direction = horizontal.normalized;
+        Vector3 perpendicular = new Vector3(-direction.z, 0f, direction.x);
+        float length = horizontal.magnitude;
+        float step = Mathf.Clamp(length / 4f, 8f, 20f);
+        int steps = Mathf.Clamp(Mathf.CeilToInt(length / step), 2, 8);
+        float[] sideOffsets = { 0f, 6f, -6f, 12f, -12f };
+        float rayStartOffset = Mathf.Max(bounds.size.y + 20f, 40f);
+
+        for (int i = 1; i < steps; i++)
+        {
+            float t = i / (float)steps;
+            Vector3 basePoint = Vector3.Lerp(start, end, t);
+            foreach (float sideOffset in sideOffsets)
+            {
+                Vector3 probe = basePoint + perpendicular * sideOffset;
+                Vector3 rayStart = probe + Vector3.up * rayStartOffset;
+                if (Physics.Raycast(rayStart, Vector3.down, out RaycastHit hit, rayStartOffset + 80f, groundLayer))
+                {
+                    Vector3 grounded = hit.point;
+                    if (!IsInsideAnyBuilding(grounded) && !generated.Any(p => Vector3.Distance(p, grounded) < 3f))
+                        generated.Add(grounded);
+                }
+            }
+        }
+
+        return generated;
+    }
+
+    private float DistancePointToSegment(Vector2 point, Vector2 a, Vector2 b)
+    {
+        Vector2 ab = b - a;
+        float denominator = Vector2.Dot(ab, ab);
+        if (denominator <= 0.0001f)
+            return Vector2.Distance(point, a);
+
+        float t = Mathf.Clamp01(Vector2.Dot(point - a, ab) / denominator);
+        return Vector2.Distance(point, a + ab * t);
     }
 
     private float CalculateClosedTraverseShapeScore(List<Station> stations, Bounds bounds)
