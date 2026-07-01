@@ -135,8 +135,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     public void OnGenerateButtonPressed()
     {
         GenerateNetwork();
-        ExportXML(); // 
-        RunPython(); // 
+        ExportXML();
+        RunPython();
         PrintNetworkReport();
         ExportStationsToCSV();
         //PerformAdjustmentUsingExistingMatrix();
@@ -341,7 +341,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                 int redundantMarks = CountMarksWithAtLeastTwoObservers(solution);
                 int acuteMarks = CountMarksWithAcuteAngles(solution);
 
-                if (coveredGrades.Count == grades.Count && redundantMarks == grades.Count && acuteMarks == 0)
+                if (coveredGrades.Count == grades.Count && redundantMarks == grades.Count && acuteMarks == 0 && HasClosedTraverse(solution, bounds))
                 {
                     foundFullCoverage = true;
 
@@ -356,7 +356,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                         if (generation - lastLogGeneration >= 5 || generation % 10 == 0)
                         {
                             lastLogGeneration = generation;
-                            Debug.Log($"✅ Поколение {generation}: Полное покрытие + x2 наблюдения + без острых углов. Фитнес={bestFitness:F0}, " +
+                            Debug.Log($"✅ Поколение {generation}: Полное покрытие + x2 наблюдения + без острых углов + замкнутый ход. Фитнес={bestFitness:F0}, " +
                                      $"Станций={bestSolution.Count}");
                         }
 
@@ -365,7 +365,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                         {
                             Debug.Log($"🎯 Ранний выход: найдено оптимальное решение на поколении {generation}");
                             stopwatch.Stop();
-                            return RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider);
+                            return OrderStationsAsClosedTraverse(RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider), bounds);
                         }
                     }
                 }
@@ -639,17 +639,17 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                     float fallbackFitness = CalculateFitness(fallback, bounds, buildingCollider);
 
                     var candidateBest = fallbackFitness > bestFitnessVal ? fallback : bestSolution;
-                    return RefineSolutionForRedundancyAndAngles(candidateBest, candidatePositions, bounds, buildingCollider);
+                    return OrderStationsAsClosedTraverse(RefineSolutionForRedundancyAndAngles(candidateBest, candidatePositions, bounds, buildingCollider), bounds);
                 }
             }
 
-            return RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider);
+            return OrderStationsAsClosedTraverse(RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider), bounds);
         }
         else
         {
             Debug.LogWarning("ГА не нашел решения, используем fallback");
             var fallback = GenerateFallbackSolution(bounds, buildingCollider, baseOffset);
-            return RefineSolutionForRedundancyAndAngles(fallback, candidatePositions, bounds, buildingCollider);
+            return OrderStationsAsClosedTraverse(RefineSolutionForRedundancyAndAngles(fallback, candidatePositions, bounds, buildingCollider), bounds);
         }
     }
 
@@ -872,7 +872,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         int randomCount = Mathf.Max(3, populationSize / 4);      // 25% - случайные решения
         int geometricCount = Mathf.Max(2, populationSize / 6);   // ~17% - геометрические решения
         int uniformCount = Mathf.Max(2, populationSize / 6);     // ~17% - равномерное распределение
-        int restCount = populationSize - greedyCount - randomCount - geometricCount - uniformCount; // Остальные - смешанные
+        int traverseCount = Mathf.Max(3, populationSize / 5);    // 20% - замкнутые ходы
+        int restCount = populationSize - greedyCount - randomCount - geometricCount - uniformCount - traverseCount; // Остальные - смешанные
 
         // ================== 2. ГЕНЕРАЦИЯ ЖАДНЫХ РЕШЕНИЙ (максимальное покрытие) ==================
         for (int i = 0; i < greedyCount && population.Count < populationSize; i++)
@@ -918,10 +919,22 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             }
         }
 
+
+        // ================== 5.1. ГЕНЕРАЦИЯ ЗАМКНУТЫХ ПОЛИГОНОМЕТРИЧЕСКИХ ХОДОВ ==================
+        for (int i = 0; i < traverseCount && population.Count < populationSize; i++)
+        {
+            var traverseSolution = GenerateClosedTraverseSolution(candidatePositions, i);
+            if (traverseSolution != null && traverseSolution.Count >= minStations)
+            {
+                population.Add(traverseSolution);
+                Debug.Log($"Замкнутый ход {i + 1}: {traverseSolution.Count} станций");
+            }
+        }
+
         // ================== 6. ДОПОЛНЕНИЕ СМЕШАННЫМИ РЕШЕНИЯМИ ==================
         while (population.Count < populationSize)
         {
-            int strategy = UnityEngine.Random.Range(0, 4);
+            int strategy = UnityEngine.Random.Range(0, 5);
             List<Station> mixedSolution = null;
 
             switch (strategy)
@@ -937,6 +950,9 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                     break;
                 case 3:
                     mixedSolution = GenerateUniformSolution(candidatePositions, population.Count);
+                    break;
+                case 4:
+                    mixedSolution = GenerateClosedTraverseSolution(candidatePositions, population.Count);
                     break;
             }
 
@@ -980,6 +996,78 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     }
 
     // ================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ==================
+
+
+    private List<Station> GenerateClosedTraverseSolution(List<Vector3> candidatePositions, int seed)
+    {
+        UnityEngine.Random.InitState(seed + System.DateTime.Now.Millisecond * 5);
+        if (candidatePositions == null || candidatePositions.Count == 0 || targetBuilding == null)
+            return null;
+
+        Bounds bounds = GetObjectBounds(targetBuilding);
+        Vector3 center = bounds.center;
+        int stationCount = UnityEngine.Random.Range(minStations, Mathf.Min(9, candidatePositions.Count) + 1);
+        float sectorStep = 360f / stationCount;
+        float startAngle = UnityEngine.Random.Range(0f, sectorStep);
+
+        var solution = new List<Station>();
+        for (int i = 0; i < stationCount; i++)
+        {
+            float sectorCenter = startAngle + i * sectorStep;
+            var sectorCandidates = candidatePositions
+                .Select(pos => new
+                {
+                    Position = pos,
+                    Visible = GetVisibleGradesFromPos(pos),
+                    Delta = Mathf.Abs(Mathf.DeltaAngle(sectorCenter, Mathf.Atan2(pos.z - center.z, pos.x - center.x) * Mathf.Rad2Deg))
+                })
+                .Where(x => x.Visible.Count > 0 && x.Delta <= sectorStep * 0.65f)
+                .OrderByDescending(x => x.Visible.Count * 1000f - x.Delta)
+                .ToList();
+
+            foreach (var candidate in sectorCandidates)
+            {
+                if (solution.Any(s => Vector3.Distance(s.position, candidate.Position) < 8f))
+                    continue;
+
+                solution.Add(new Station { position = candidate.Position, visibleGrades = candidate.Visible });
+                break;
+            }
+        }
+
+        if (solution.Count < minStations)
+            return null;
+
+        solution = OrderStationsAsClosedTraverse(solution, bounds);
+
+        // Если один из ходовых ходов невидим, пытаемся локально заменить проблемную вершину.
+        for (int pass = 0; pass < 2 && !HasClosedTraverse(solution, bounds); pass++)
+        {
+            for (int i = 0; i < solution.Count; i++)
+            {
+                int prev = (i - 1 + solution.Count) % solution.Count;
+                int next = (i + 1) % solution.Count;
+                if (HasLineOfSight(solution[prev].position + Vector3.up * 1.7f, solution[i].position + Vector3.up * 1.7f) &&
+                    HasLineOfSight(solution[i].position + Vector3.up * 1.7f, solution[next].position + Vector3.up * 1.7f))
+                    continue;
+
+                float currentAngle = Mathf.Atan2(solution[i].position.z - center.z, solution[i].position.x - center.x) * Mathf.Rad2Deg;
+                var replacement = candidatePositions
+                    .Select(pos => new { Position = pos, Visible = GetVisibleGradesFromPos(pos) })
+                    .Where(x => x.Visible.Count > 0 && !solution.Any(s => Vector3.Distance(s.position, x.Position) < 8f))
+                    .Where(x => Mathf.Abs(Mathf.DeltaAngle(currentAngle, Mathf.Atan2(x.Position.z - center.z, x.Position.x - center.x) * Mathf.Rad2Deg)) < sectorStep)
+                    .Where(x => HasLineOfSight(solution[prev].position + Vector3.up * 1.7f, x.Position + Vector3.up * 1.7f) &&
+                                HasLineOfSight(x.Position + Vector3.up * 1.7f, solution[next].position + Vector3.up * 1.7f))
+                    .OrderByDescending(x => x.Visible.Count)
+                    .FirstOrDefault();
+
+                if (replacement != null)
+                    solution[i] = new Station { position = replacement.Position, visibleGrades = replacement.Visible };
+            }
+        }
+
+        return solution;
+    }
 
     private List<Station> GenerateGreedySolution(List<Vector3> candidatePositions, int seed)
     {
@@ -1437,6 +1525,96 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         return (minDistance + maxDistance) * 0.5f;
     }
 
+
+    private List<Station> OrderStationsAsClosedTraverse(List<Station> stations, Bounds bounds)
+    {
+        if (stations == null)
+            return new List<Station>();
+
+        Vector3 center = bounds.center;
+        return stations
+            .Where(s => s != null)
+            .OrderBy(s => Mathf.Atan2(s.position.z - center.z, s.position.x - center.x))
+            .Select(s => new Station
+            {
+                position = s.position,
+                networkObj = s.networkObj,
+                ms60 = s.ms60,
+                visibleGrades = s.visibleGrades != null
+                    ? new HashSet<Transform>(s.visibleGrades)
+                    : GetVisibleGradesFromPos(s.position)
+            })
+            .ToList();
+    }
+
+    private int CountClosedTraverseLinks(List<Station> stations, Bounds bounds)
+    {
+        if (stations == null || stations.Count < 3)
+            return 0;
+
+        var ordered = OrderStationsAsClosedTraverse(stations, bounds);
+        int links = 0;
+        for (int i = 0; i < ordered.Count; i++)
+        {
+            Vector3 from = ordered[i].position + Vector3.up * 1.7f;
+            Vector3 to = ordered[(i + 1) % ordered.Count].position + Vector3.up * 1.7f;
+            if (HasLineOfSight(from, to))
+                links++;
+        }
+
+        return links;
+    }
+
+    private bool HasClosedTraverse(List<Station> stations, Bounds bounds)
+    {
+        return stations != null && stations.Count >= minStations && CountClosedTraverseLinks(stations, bounds) == stations.Count;
+    }
+
+    private float CalculateClosedTraverseShapeScore(List<Station> stations, Bounds bounds)
+    {
+        if (stations == null || stations.Count < 3)
+            return 0f;
+
+        var ordered = OrderStationsAsClosedTraverse(stations, bounds);
+        Vector3 center = bounds.center;
+        float targetRadius = 0f;
+        foreach (var station in ordered)
+            targetRadius += Vector3.Distance(new Vector3(station.position.x, 0f, station.position.z), new Vector3(center.x, 0f, center.z));
+        targetRadius /= ordered.Count;
+
+        float radiusPenalty = 0f;
+        float minSide = float.MaxValue;
+        float maxSide = 0f;
+        float turnScore = 0f;
+
+        for (int i = 0; i < ordered.Count; i++)
+        {
+            Vector3 prev = ordered[(i - 1 + ordered.Count) % ordered.Count].position;
+            Vector3 cur = ordered[i].position;
+            Vector3 next = ordered[(i + 1) % ordered.Count].position;
+
+            float radius = Vector3.Distance(new Vector3(cur.x, 0f, cur.z), new Vector3(center.x, 0f, center.z));
+            if (targetRadius > 0.001f)
+                radiusPenalty += Mathf.Abs(radius - targetRadius) / targetRadius;
+
+            float side = Vector3.Distance(cur, next);
+            minSide = Mathf.Min(minSide, side);
+            maxSide = Mathf.Max(maxSide, side);
+
+            Vector3 a = (prev - cur).normalized;
+            Vector3 b = (next - cur).normalized;
+            float angle = Vector3.Angle(a, b);
+            if (angle >= 60f && angle <= 160f)
+                turnScore += 1f;
+        }
+
+        float radiusScore = Mathf.Clamp01(1f - radiusPenalty / ordered.Count);
+        float sideScore = maxSide > 0.001f ? Mathf.Clamp01(minSide / maxSide) : 0f;
+        float angleScore = turnScore / ordered.Count;
+
+        return (radiusScore * 0.4f + sideScore * 0.3f + angleScore * 0.3f) * 100000f;
+    }
+
     private int CountMarksWithAtLeastTwoObservers(List<Station> solution)
     {
         if (solution == null || grades == null || grades.Count == 0)
@@ -1705,6 +1883,19 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         fitness += visiblePairs * 400f;
         if (visiblePairs >= solution.Count - 1)
             fitness += 10000f;
+
+        // ================== 9.1. ПОЛИГОНОМЕТРИЯ ЗАМКНУТОГО ХОДА ==================
+        // Станции сортируются по азимуту вокруг здания и должны образовывать видимый
+        // замкнутый ход: T1-T2-...-Tn-T1. Такой критерий заставляет ГА строить
+        // не произвольное облако точек, а связанный полигонометрический контур.
+        int traverseLinks = CountClosedTraverseLinks(solution, bounds);
+        float traverseRatio = solution.Count > 0 ? traverseLinks / (float)solution.Count : 0f;
+        fitness += traverseRatio * 120000f;
+
+        if (traverseLinks == solution.Count)
+            fitness += 250000f + CalculateClosedTraverseShapeScore(solution, bounds);
+        else
+            fitness -= (solution.Count - traverseLinks) * 60000f;
 
         // Штраф за дублирующее покрытие
         for (int i = 0; i < solution.Count; i++)
