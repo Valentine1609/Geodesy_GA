@@ -1890,9 +1890,255 @@ public class GeodeticNetworkGenerator : MonoBehaviour
     {
         var finalized = EnsureClosedTraverseConnectivity(stations, candidatePositions, bounds);
         finalized = EnsureStationsOnBothGradeSides(finalized, candidatePositions, bounds);
+        finalized = EnsureFullGradeCoverage(finalized, candidatePositions, bounds, requiredObservers: 2);
         finalized = EnsureClosedTraverseConnectivity(finalized, candidatePositions, bounds);
         finalized = EnsureExcellentConditioning(finalized, candidatePositions, bounds);
-        return EnsureClosedTraverseConnectivity(finalized, candidatePositions, bounds);
+        finalized = EnsureFullGradeCoverage(finalized, candidatePositions, bounds, requiredObservers: 2);
+        finalized = EnsureClosedTraverseConnectivity(finalized, candidatePositions, bounds);
+        return PruneStationsForTwoObserverClosedNetwork(finalized, bounds);
+    }
+
+    private List<Station> EnsureFullGradeCoverage(List<Station> stations, List<Vector3> candidatePositions, Bounds bounds, int requiredObservers)
+    {
+        var result = stations == null
+            ? new List<Station>()
+            : stations.Where(s => s != null).Select(s => new Station
+            {
+                position = s.position,
+                visibleGrades = s.visibleGrades != null ? new HashSet<Transform>(s.visibleGrades) : GetVisibleGradesFromPos(s.position)
+            }).ToList();
+
+        if (grades == null || grades.Count == 0)
+            return OrderStationsAsClosedTraverse(result, bounds);
+
+        var repairPool = new List<Vector3>();
+        if (candidatePositions != null)
+            repairPool.AddRange(candidatePositions);
+        repairPool.AddRange(GenerateGradeFocusedRepairCandidates(bounds));
+        repairPool = RemoveDuplicateCandidatePositions(repairPool, 3f);
+
+        int maxRepairStations = Mathf.Clamp(Mathf.CeilToInt(grades.Count / 2f), 2, 5);
+        const float minSpacing = 5f;
+        for (int added = 0; added < maxRepairStations; added++)
+        {
+            foreach (var station in result)
+                station.visibleGrades = GetVisibleGradesFromPos(station.position);
+
+            var observationCounts = grades.ToDictionary(g => g, _ => 0);
+            foreach (var station in result)
+            {
+                if (station.visibleGrades == null) continue;
+                foreach (var grade in station.visibleGrades)
+                {
+                    if (observationCounts.ContainsKey(grade))
+                        observationCounts[grade]++;
+                }
+            }
+
+            var weakGrades = observationCounts
+                .Where(pair => pair.Value < requiredObservers)
+                .Select(pair => pair.Key)
+                .ToList();
+
+            if (weakGrades.Count == 0)
+                break;
+
+            Vector3? bestPos = null;
+            HashSet<Transform> bestVisible = null;
+            float bestScore = float.MinValue;
+
+            foreach (var candidate in repairPool)
+            {
+                if (IsInsideAnyBuilding(candidate) || result.Any(st => Vector3.Distance(st.position, candidate) < minSpacing))
+                    continue;
+
+                var visible = GetVisibleGradesFromPos(candidate);
+                if (visible == null || visible.Count == 0)
+                    continue;
+
+                int repairedWeakGrades = visible.Count(g => weakGrades.Contains(g));
+                if (repairedWeakGrades == 0)
+                    continue;
+
+                float sideBonus = 0f;
+                if (GradesExistOnBothSides(bounds))
+                {
+                    Vector3 axis = GetDominantGradeAxis(bounds);
+                    sideBonus = visible.Count(g => Mathf.Sign(GetSignedSide(g.position, bounds.center, axis)) ==
+                                                  Mathf.Sign(GetSignedSide(candidate, bounds.center, axis))) * 75f;
+                }
+
+                float score = repairedWeakGrades * 10000f + visible.Count * 250f + sideBonus;
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestPos = candidate;
+                    bestVisible = visible;
+                }
+            }
+
+            if (!bestPos.HasValue || bestVisible == null)
+            {
+                Debug.LogWarning($"Не удалось добавить станцию для полного покрытия: осталось слабых марок {weakGrades.Count}");
+                break;
+            }
+
+            result.Add(new Station { position = bestPos.Value, visibleGrades = bestVisible });
+            Debug.Log($"Добавлена ремонтная станция: закрыто слабых марок {bestVisible.Count(g => weakGrades.Contains(g))}/{weakGrades.Count}");
+        }
+
+        return OrderStationsAsClosedTraverse(result, bounds);
+    }
+
+    private List<Station> PruneStationsForTwoObserverClosedNetwork(List<Station> stations, Bounds bounds)
+    {
+        var result = OrderStationsAsClosedTraverse(stations, bounds);
+        if (result.Count <= minStations || grades == null || grades.Count == 0)
+            return result;
+
+        foreach (var station in result)
+            station.visibleGrades = GetVisibleGradesFromPos(station.position);
+
+        int targetStationCount = Mathf.Max(minStations, Mathf.CeilToInt(grades.Count / 2f));
+        bool removedAny = true;
+
+        while (removedAny && result.Count > targetStationCount)
+        {
+            removedAny = false;
+            int removeIndex = FindBestRemovableStationIndex(result, bounds);
+            if (removeIndex < 0)
+                break;
+
+            result.RemoveAt(removeIndex);
+            result = OrderStationsAsClosedTraverse(result, bounds);
+            removedAny = true;
+        }
+
+        return result;
+    }
+
+    private int FindBestRemovableStationIndex(List<Station> stations, Bounds bounds)
+    {
+        int bestIndex = -1;
+        float bestScore = float.MinValue;
+
+        for (int i = 0; i < stations.Count; i++)
+        {
+            var candidate = stations.Where((_, index) => index != i).ToList();
+            foreach (var station in candidate)
+                station.visibleGrades = GetVisibleGradesFromPos(station.position);
+
+            if (candidate.Count < minStations || !HasRequiredGradeObservers(candidate, requiredObservers: 2))
+                continue;
+
+            // Удаляем только те станции, после которых оставшиеся станции поочередно
+            // видят друг друга в замкнутом ходе T1-T2-...-Tn-T1.
+            if (!HasClosedTraverse(candidate, bounds))
+                continue;
+
+            int redundantObservations = CountObservationsAboveRequired(candidate, requiredObservers: 2);
+            float stationCoverage = stations[i].visibleGrades != null ? stations[i].visibleGrades.Count : 0f;
+            float score = redundantObservations * 1000f - stationCoverage;
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestIndex = i;
+            }
+        }
+
+        return bestIndex;
+    }
+
+    private bool HasRequiredGradeObservers(List<Station> stations, int requiredObservers)
+    {
+        return CountGradeObservers(stations).Values.All(count => count >= requiredObservers);
+    }
+
+    private int CountObservationsAboveRequired(List<Station> stations, int requiredObservers)
+    {
+        return CountGradeObservers(stations).Values.Sum(count => Mathf.Max(0, count - requiredObservers));
+    }
+
+    private Dictionary<Transform, int> CountGradeObservers(List<Station> stations)
+    {
+        var counts = new Dictionary<Transform, int>();
+        if (grades == null)
+            return counts;
+
+        foreach (var grade in grades)
+            counts[grade] = 0;
+
+        if (stations == null)
+            return counts;
+
+        foreach (var station in stations)
+        {
+            if (station?.visibleGrades == null) continue;
+            foreach (var grade in station.visibleGrades)
+            {
+                if (counts.ContainsKey(grade))
+                    counts[grade]++;
+            }
+        }
+
+        return counts;
+    }
+
+    private List<Vector3> GenerateGradeFocusedRepairCandidates(Bounds bounds)
+    {
+        var generated = new List<Vector3>();
+        if (grades == null)
+            return generated;
+
+        float rayStartOffset = Mathf.Max(bounds.size.y + 20f, 40f);
+        float baseDistance = CalculateOptimalDistance(bounds);
+        float[] angleOffsets = { -60f, -35f, -15f, 0f, 15f, 35f, 60f, 180f };
+        float[] distanceFactors = { 0.35f, 0.55f, 0.8f, 1.1f };
+
+        foreach (var grade in grades)
+        {
+            if (grade == null) continue;
+
+            Vector3 outward = grade.position - bounds.center;
+            outward.y = 0f;
+            if (outward.sqrMagnitude < 0.001f)
+                outward = bounds.size.x >= bounds.size.z ? Vector3.forward : Vector3.right;
+            outward.Normalize();
+
+            foreach (float angleOffset in angleOffsets)
+            {
+                Vector3 dir = Quaternion.Euler(0f, angleOffset, 0f) * outward;
+                foreach (float factor in distanceFactors)
+                {
+                    Vector3 probe = grade.position + dir * baseDistance * factor;
+                    Vector3 rayStart = probe + Vector3.up * rayStartOffset;
+                    if (Physics.Raycast(rayStart, Vector3.down, out RaycastHit hit, rayStartOffset + 80f, groundLayer))
+                    {
+                        Vector3 grounded = hit.point;
+                        if (!IsInsideAnyBuilding(grounded))
+                            generated.Add(grounded);
+                    }
+                }
+            }
+        }
+
+        return generated;
+    }
+
+    private List<Vector3> RemoveDuplicateCandidatePositions(List<Vector3> candidates, float minDistance)
+    {
+        var unique = new List<Vector3>();
+        if (candidates == null)
+            return unique;
+
+        foreach (var candidate in candidates)
+        {
+            if (!unique.Any(existing => Vector3.Distance(existing, candidate) < minDistance))
+                unique.Add(candidate);
+        }
+
+        return unique;
     }
 
     private List<Station> EnsureStationsOnBothGradeSides(List<Station> stations, List<Vector3> candidatePositions, Bounds bounds)
@@ -2218,6 +2464,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         }
 
         float redundancyRatio = (float)wellObservedGrades / grades.Count;
+        int extraGradeObservations = gradeObservationCount.Values.Sum(count => Mathf.Max(0, count - 2));
 
         // ЖЁСТКОЕ ТРЕБОВАНИЕ: все марки должны быть видны из ≥2 станций
         if (redundancyRatio < 1.0f)
@@ -2230,6 +2477,10 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
         // ================== 5. ГЛАВНЫЙ ФИТНЕС: ПОЛНОЕ ПОКРЫТИЕ + РЕДУНДАНТНОСТЬ ==================
         float fitness = 100000f;
+
+        // На одну марку достаточно двух наблюдений. Дополнительные наблюдения не запрещены,
+        // но сильно штрафуются, чтобы алгоритм не плодил лишние станции.
+        fitness -= extraGradeObservations * 12000f;
 
         // Поощряем конфигурации, где отдельная станция "берёт" максимум марок,
         // и где станции стоят дальше от марок (в пределах реалистичной дальности).
@@ -2266,7 +2517,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         if (solution.Count > optimalCount)
         {
             int excessStations = solution.Count - optimalCount;
-            fitness -= excessStations * 30000f;
+            fitness -= excessStations * 60000f;
         }
         else if (solution.Count < optimalCount)
         {
@@ -2417,7 +2668,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         }
 
         // ================== 10. ФИНАЛЬНЫЙ ШТРАФ/БОНУС ==================
-        fitness -= solution.Count * 3000f;
+        fitness -= solution.Count * 8000f;
         if (solution.Count <= optimalCount)
             fitness += 50000f;
 
