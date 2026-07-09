@@ -1894,7 +1894,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         finalized = EnsureClosedTraverseConnectivity(finalized, candidatePositions, bounds);
         finalized = EnsureExcellentConditioning(finalized, candidatePositions, bounds);
         finalized = EnsureFullGradeCoverage(finalized, candidatePositions, bounds, requiredObservers: 2);
-        return EnsureClosedTraverseConnectivity(finalized, candidatePositions, bounds);
+        finalized = EnsureClosedTraverseConnectivity(finalized, candidatePositions, bounds);
+        return PruneStationsForTwoObserverClosedNetwork(finalized, bounds);
     }
 
     private List<Station> EnsureFullGradeCoverage(List<Station> stations, List<Vector3> candidatePositions, Bounds bounds, int requiredObservers)
@@ -1916,7 +1917,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         repairPool.AddRange(GenerateGradeFocusedRepairCandidates(bounds));
         repairPool = RemoveDuplicateCandidatePositions(repairPool, 3f);
 
-        const int maxRepairStations = 8;
+        int maxRepairStations = Mathf.Clamp(Mathf.CeilToInt(grades.Count / 2f), 2, 5);
         const float minSpacing = 5f;
         for (int added = 0; added < maxRepairStations; added++)
         {
@@ -1987,6 +1988,101 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         }
 
         return OrderStationsAsClosedTraverse(result, bounds);
+    }
+
+    private List<Station> PruneStationsForTwoObserverClosedNetwork(List<Station> stations, Bounds bounds)
+    {
+        var result = OrderStationsAsClosedTraverse(stations, bounds);
+        if (result.Count <= minStations || grades == null || grades.Count == 0)
+            return result;
+
+        foreach (var station in result)
+            station.visibleGrades = GetVisibleGradesFromPos(station.position);
+
+        int targetStationCount = Mathf.Max(minStations, Mathf.CeilToInt(grades.Count / 2f));
+        bool removedAny = true;
+
+        while (removedAny && result.Count > targetStationCount)
+        {
+            removedAny = false;
+            int removeIndex = FindBestRemovableStationIndex(result, bounds);
+            if (removeIndex < 0)
+                break;
+
+            result.RemoveAt(removeIndex);
+            result = OrderStationsAsClosedTraverse(result, bounds);
+            removedAny = true;
+        }
+
+        return result;
+    }
+
+    private int FindBestRemovableStationIndex(List<Station> stations, Bounds bounds)
+    {
+        int bestIndex = -1;
+        float bestScore = float.MinValue;
+
+        for (int i = 0; i < stations.Count; i++)
+        {
+            var candidate = stations.Where((_, index) => index != i).ToList();
+            foreach (var station in candidate)
+                station.visibleGrades = GetVisibleGradesFromPos(station.position);
+
+            if (candidate.Count < minStations || !HasRequiredGradeObservers(candidate, requiredObservers: 2))
+                continue;
+
+            // Удаляем только те станции, после которых оставшиеся станции поочередно
+            // видят друг друга в замкнутом ходе T1-T2-...-Tn-T1.
+            if (!HasClosedTraverse(candidate, bounds))
+                continue;
+
+            int redundantObservations = CountObservationsAboveRequired(candidate, requiredObservers: 2);
+            float stationCoverage = stations[i].visibleGrades != null ? stations[i].visibleGrades.Count : 0f;
+            float score = redundantObservations * 1000f - stationCoverage;
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestIndex = i;
+            }
+        }
+
+        return bestIndex;
+    }
+
+    private bool HasRequiredGradeObservers(List<Station> stations, int requiredObservers)
+    {
+        return CountGradeObservers(stations).Values.All(count => count >= requiredObservers);
+    }
+
+    private int CountObservationsAboveRequired(List<Station> stations, int requiredObservers)
+    {
+        return CountGradeObservers(stations).Values.Sum(count => Mathf.Max(0, count - requiredObservers));
+    }
+
+    private Dictionary<Transform, int> CountGradeObservers(List<Station> stations)
+    {
+        var counts = new Dictionary<Transform, int>();
+        if (grades == null)
+            return counts;
+
+        foreach (var grade in grades)
+            counts[grade] = 0;
+
+        if (stations == null)
+            return counts;
+
+        foreach (var station in stations)
+        {
+            if (station?.visibleGrades == null) continue;
+            foreach (var grade in station.visibleGrades)
+            {
+                if (counts.ContainsKey(grade))
+                    counts[grade]++;
+            }
+        }
+
+        return counts;
     }
 
     private List<Vector3> GenerateGradeFocusedRepairCandidates(Bounds bounds)
@@ -2368,6 +2464,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         }
 
         float redundancyRatio = (float)wellObservedGrades / grades.Count;
+        int extraGradeObservations = gradeObservationCount.Values.Sum(count => Mathf.Max(0, count - 2));
 
         // ЖЁСТКОЕ ТРЕБОВАНИЕ: все марки должны быть видны из ≥2 станций
         if (redundancyRatio < 1.0f)
@@ -2380,6 +2477,10 @@ public class GeodeticNetworkGenerator : MonoBehaviour
 
         // ================== 5. ГЛАВНЫЙ ФИТНЕС: ПОЛНОЕ ПОКРЫТИЕ + РЕДУНДАНТНОСТЬ ==================
         float fitness = 100000f;
+
+        // На одну марку достаточно двух наблюдений. Дополнительные наблюдения не запрещены,
+        // но сильно штрафуются, чтобы алгоритм не плодил лишние станции.
+        fitness -= extraGradeObservations * 12000f;
 
         // Поощряем конфигурации, где отдельная станция "берёт" максимум марок,
         // и где станции стоят дальше от марок (в пределах реалистичной дальности).
@@ -2416,7 +2517,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         if (solution.Count > optimalCount)
         {
             int excessStations = solution.Count - optimalCount;
-            fitness -= excessStations * 30000f;
+            fitness -= excessStations * 60000f;
         }
         else if (solution.Count < optimalCount)
         {
@@ -2567,7 +2668,7 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         }
 
         // ================== 10. ФИНАЛЬНЫЙ ШТРАФ/БОНУС ==================
-        fitness -= solution.Count * 3000f;
+        fitness -= solution.Count * 8000f;
         if (solution.Count <= optimalCount)
             fitness += 50000f;
 
