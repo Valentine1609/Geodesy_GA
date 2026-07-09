@@ -239,11 +239,11 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         // ЗАЩИТА: убеждаемся, что stationCountFactor не равен нулю
         if (stationCountFactor <= 0) stationCountFactor = 1f;
 
-        int populationSize = Mathf.Clamp(grades.Count * 2, 10, 30); //  популяция
-        int generations = Mathf.Clamp(grades.Count * 3, 30, 60);    // поколение
-        float mutationRate = 0.6f;  // ВЫСОКИЙ шанс мутации для разнообразия
-        float crossoverRate = 0.8f; // ВЫСОКИЙ шанс кроссовера
-        int eliteCount = Mathf.Clamp(populationSize / 5, 3, 8); // Элитизм
+        int populationSize = Mathf.Clamp(grades.Count * 4, 40, 90); // расширенная популяция для поиска станций с обеих сторон
+        int generations = Mathf.Clamp(grades.Count * 8, 80, 180);   // больше поколений для замкнутого хода и хорошей обусловленности
+        float mutationRate = 0.35f; // ниже стартовая мутация: меньше ломает найденные двухсторонние решения
+        float crossoverRate = 0.85f; // высокий шанс кроссовера для комбинирования сторон здания
+        int eliteCount = Mathf.Clamp(populationSize / 6, 5, 12); // больше элиты, чтобы сохранять удачные ходы
 
         // ЗАЩИТА: проверяем, что eliteCount не отрицательный
         eliteCount = Mathf.Max(2, eliteCount);
@@ -450,9 +450,9 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             {
                 attempts++;
 
-                // 50% вероятности использовать кроссовер, 50% - клонирование
+                // Используем настраиваемую вероятность кроссовера, чтобы чаще комбинировать удачные стороны здания.
                 List<Station> offspring;
-                if (UnityEngine.Random.value < 0.5f && fitnessScores.Count >= 2)
+                if (UnityEngine.Random.value < crossoverRate && fitnessScores.Count >= 2)
                 {
                     // КРОССОВЕР двух родителей
                     var parent1 = TournamentSelection(fitnessScores, 3);
