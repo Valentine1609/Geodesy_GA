@@ -263,11 +263,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         // ОГРАНИЧИВАЕМ количество кандидатов при большом количестве марок
         if (candidatePositions.Count > 150)
         {
-            candidatePositions = candidatePositions
-                .OrderBy(x => UnityEngine.Random.value)
-                .Take(150)
-                .ToList();
-            Debug.Log($"Ограничено количество кандидатов до {candidatePositions.Count}");
+            candidatePositions = SelectBalancedCandidatesByGradeSides(candidatePositions, bounds, 150);
+            Debug.Log($"Ограничено количество кандидатов до {candidatePositions.Count} с балансом по сторонам здания");
         }
 
         Debug.Log($"Запуск ГА: {grades.Count} марок, кандидатов={candidatePositions.Count}, " +
@@ -365,11 +362,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                         {
                             Debug.Log($"🎯 Ранний выход: найдено оптимальное решение на поколении {generation}");
                             stopwatch.Stop();
-                            return EnsureExcellentConditioning(
-                                EnsureClosedTraverseConnectivity(
-                                    RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider),
-                                    candidatePositions,
-                                    bounds),
+                            return FinalizeNetworkQuality(
+                                RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider),
                                 candidatePositions,
                                 bounds);
                         }
@@ -645,21 +639,15 @@ public class GeodeticNetworkGenerator : MonoBehaviour
                     float fallbackFitness = CalculateFitness(fallback, bounds, buildingCollider);
 
                     var candidateBest = fallbackFitness > bestFitnessVal ? fallback : bestSolution;
-                    return EnsureExcellentConditioning(
-                        EnsureClosedTraverseConnectivity(
-                            RefineSolutionForRedundancyAndAngles(candidateBest, candidatePositions, bounds, buildingCollider),
-                            candidatePositions,
-                            bounds),
+                    return FinalizeNetworkQuality(
+                        RefineSolutionForRedundancyAndAngles(candidateBest, candidatePositions, bounds, buildingCollider),
                         candidatePositions,
                         bounds);
                 }
             }
 
-            return EnsureExcellentConditioning(
-                EnsureClosedTraverseConnectivity(
-                    RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider),
-                    candidatePositions,
-                    bounds),
+            return FinalizeNetworkQuality(
+                RefineSolutionForRedundancyAndAngles(bestSolution, candidatePositions, bounds, buildingCollider),
                 candidatePositions,
                 bounds);
         }
@@ -667,11 +655,8 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         {
             Debug.LogWarning("ГА не нашел решения, используем fallback");
             var fallback = GenerateFallbackSolution(bounds, buildingCollider, baseOffset);
-            return EnsureExcellentConditioning(
-                EnsureClosedTraverseConnectivity(
-                    RefineSolutionForRedundancyAndAngles(fallback, candidatePositions, bounds, buildingCollider),
-                    candidatePositions,
-                    bounds),
+            return FinalizeNetworkQuality(
+                RefineSolutionForRedundancyAndAngles(fallback, candidatePositions, bounds, buildingCollider),
                 candidatePositions,
                 bounds);
         }
@@ -1870,6 +1855,173 @@ public class GeodeticNetworkGenerator : MonoBehaviour
         return acuteMarks;
     }
 
+    private List<Vector3> SelectBalancedCandidatesByGradeSides(List<Vector3> candidates, Bounds bounds, int maxCount)
+    {
+        if (candidates == null || candidates.Count <= maxCount || !GradesExistOnBothSides(bounds))
+            return candidates;
+
+        Vector3 axis = GetDominantGradeAxis(bounds);
+        var negative = candidates
+            .Where(pos => GetSignedSide(pos, bounds.center, axis) < 0f)
+            .OrderBy(_ => UnityEngine.Random.value)
+            .ToList();
+        var positive = candidates
+            .Where(pos => GetSignedSide(pos, bounds.center, axis) >= 0f)
+            .OrderBy(_ => UnityEngine.Random.value)
+            .ToList();
+
+        int half = maxCount / 2;
+        var selected = new List<Vector3>();
+        selected.AddRange(negative.Take(half));
+        selected.AddRange(positive.Take(half));
+
+        if (selected.Count < maxCount)
+        {
+            selected.AddRange(candidates
+                .Where(pos => !selected.Any(existing => Vector3.Distance(existing, pos) < 0.01f))
+                .OrderBy(_ => UnityEngine.Random.value)
+                .Take(maxCount - selected.Count));
+        }
+
+        return selected;
+    }
+
+    private List<Station> FinalizeNetworkQuality(List<Station> stations, List<Vector3> candidatePositions, Bounds bounds)
+    {
+        var finalized = EnsureClosedTraverseConnectivity(stations, candidatePositions, bounds);
+        finalized = EnsureStationsOnBothGradeSides(finalized, candidatePositions, bounds);
+        finalized = EnsureClosedTraverseConnectivity(finalized, candidatePositions, bounds);
+        finalized = EnsureExcellentConditioning(finalized, candidatePositions, bounds);
+        return EnsureClosedTraverseConnectivity(finalized, candidatePositions, bounds);
+    }
+
+    private List<Station> EnsureStationsOnBothGradeSides(List<Station> stations, List<Vector3> candidatePositions, Bounds bounds)
+    {
+        var result = OrderStationsAsClosedTraverse(stations, bounds);
+        if (candidatePositions == null || candidatePositions.Count == 0 || !GradesExistOnBothSides(bounds))
+            return result;
+
+        Vector3 axis = GetDominantGradeAxis(bounds);
+        bool hasNegativeStation = result.Any(st => GetSignedSide(st.position, bounds.center, axis) < 0f);
+        bool hasPositiveStation = result.Any(st => GetSignedSide(st.position, bounds.center, axis) >= 0f);
+
+        if (hasNegativeStation && hasPositiveStation)
+            return result;
+
+        bool needPositive = !hasPositiveStation;
+        Vector3? bestPos = null;
+        HashSet<Transform> bestVisible = null;
+        float bestScore = float.MinValue;
+
+        foreach (var candidate in candidatePositions)
+        {
+            float side = GetSignedSide(candidate, bounds.center, axis);
+            if ((needPositive && side < 0f) || (!needPositive && side >= 0f))
+                continue;
+
+            if (IsInsideAnyBuilding(candidate) || result.Any(st => Vector3.Distance(st.position, candidate) < 6f))
+                continue;
+
+            var visible = GetVisibleGradesFromPos(candidate);
+            if (visible == null || visible.Count == 0)
+                continue;
+
+            int sameSideGrades = visible.Count(g => IsGradeOnRequestedSide(g, bounds, axis, needPositive));
+            if (sameSideGrades == 0)
+                continue;
+
+            float wallSeparation = Mathf.Abs(side);
+            float score = sameSideGrades * 1000f + visible.Count * 100f + wallSeparation;
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestPos = candidate;
+                bestVisible = visible;
+            }
+        }
+
+        if (bestPos.HasValue && bestVisible != null)
+        {
+            result.Add(new Station { position = bestPos.Value, visibleGrades = bestVisible });
+            Debug.Log($"Добавлена станция на {(needPositive ? "положительной" : "отрицательной")} стороне здания для двухстороннего покрытия марок");
+        }
+        else
+        {
+            Debug.LogWarning($"Не удалось подобрать станцию на {(needPositive ? "положительной" : "отрицательной")} стороне здания");
+        }
+
+        return OrderStationsAsClosedTraverse(result, bounds);
+    }
+
+    private bool GradesExistOnBothSides(Bounds bounds)
+    {
+        if (grades == null || grades.Count < 2)
+            return false;
+
+        Vector3 axis = GetDominantGradeAxis(bounds);
+        bool hasNegative = false;
+        bool hasPositive = false;
+        foreach (var grade in grades)
+        {
+            if (grade == null) continue;
+            if (GetSignedSide(grade.position, bounds.center, axis) < 0f) hasNegative = true;
+            else hasPositive = true;
+        }
+
+        return hasNegative && hasPositive;
+    }
+
+    private Vector3 GetDominantGradeAxis(Bounds bounds)
+    {
+        if (grades == null || grades.Count == 0)
+            return bounds.size.x >= bounds.size.z ? Vector3.right : Vector3.forward;
+
+        float minX = float.MaxValue, maxX = float.MinValue;
+        float minZ = float.MaxValue, maxZ = float.MinValue;
+        foreach (var grade in grades)
+        {
+            if (grade == null) continue;
+            minX = Mathf.Min(minX, grade.position.x);
+            maxX = Mathf.Max(maxX, grade.position.x);
+            minZ = Mathf.Min(minZ, grade.position.z);
+            maxZ = Mathf.Max(maxZ, grade.position.z);
+        }
+
+        return (maxX - minX) >= (maxZ - minZ) ? Vector3.right : Vector3.forward;
+    }
+
+    private float GetSignedSide(Vector3 position, Vector3 center, Vector3 axis)
+    {
+        return Vector3.Dot(position - center, axis.normalized);
+    }
+
+    private bool IsGradeOnRequestedSide(Transform grade, Bounds bounds, Vector3 axis, bool positiveSide)
+    {
+        if (grade == null)
+            return false;
+
+        float side = GetSignedSide(grade.position, bounds.center, axis);
+        return positiveSide ? side >= 0f : side < 0f;
+    }
+
+    private float CalculateTwoSidedStationScore(List<Station> solution, Bounds bounds)
+    {
+        if (solution == null || solution.Count == 0 || !GradesExistOnBothSides(bounds))
+            return 0f;
+
+        Vector3 axis = GetDominantGradeAxis(bounds);
+        int negativeStations = solution.Count(st => st != null && GetSignedSide(st.position, bounds.center, axis) < 0f);
+        int positiveStations = solution.Count(st => st != null && GetSignedSide(st.position, bounds.center, axis) >= 0f);
+
+        if (negativeStations == 0 || positiveStations == 0)
+            return -250000f;
+
+        int minSide = Mathf.Min(negativeStations, positiveStations);
+        int maxSide = Mathf.Max(negativeStations, positiveStations);
+        float balance = maxSide > 0 ? minSide / (float)maxSide : 0f;
+        return 120000f + balance * 80000f;
+    }
+
     private const double ExcellentConditionThreshold = 1000.0;
 
     private List<Station> EnsureExcellentConditioning(List<Station> stations, List<Vector3> candidatePositions, Bounds bounds)
@@ -2201,6 +2353,11 @@ public class GeodeticNetworkGenerator : MonoBehaviour
             else if (quadrantsOccupied == 1)
                 fitness -= 50000f;
         }
+
+        // ================== 8.1. СТАНЦИИ ПО ОБЕИМ СТОРОНАМ ЗДАНИЯ ==================
+        // Если марки расположены на двух противоположных сторонах фасада, сеть не должна
+        // оставаться только на одной стороне: это ухудшает геометрию и видимость.
+        fitness += CalculateTwoSidedStationScore(solution, bounds);
 
         // ================== 9. СВЯЗНОСТЬ И УНИКАЛЬНОСТЬ ==================
         int visiblePairs = 0;
